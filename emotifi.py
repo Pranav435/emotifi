@@ -4,31 +4,29 @@
 Emotifi — menubar Emoji/GIF/Sticker picker for macOS (single-file, Python)
 
 This build:
-  • Massive emoji dataset + smarter matching via `emoji` package.
-  • Focus always lands on Search (immediate + delayed first-responder fix).
-  • Inline '::' capture with CGEvent tap (preferred) or NSEvent fallback.
-  • Guaranteed cleanup of stray ':' or leaked '::query' on insert.
-  • NEW: If palette was opened via '::', press Backspace once right before pasting
-         for emoji, GIFs, and stickers (fixes lingering ':' in some apps).
-  • Arrow keys navigate even when the search field is focused.
-  • System TTS via NSSpeechSynthesizer (inline mode only).
-  • Click-to-insert with true paste; GIF/Sticker preview + caching.
-  • FIX: Global hotkey (⌘⇧E) dispatches UI to main thread.
-  • Emoji search: fuzzier matching + synonyms mapping (e.g., 'tasty' finds 😋 🤤 🍕).
+  • Emoji/GIF/Sticker palette with fuzzy emoji search + synonyms.
+  • Inline '::' capture via CGEvent tap (preferred) or NSEvent fallback.
+  • Backspace cleanup around inline insertion (no stray colons).
+  • Global hotkey (⌘⇧E by default), thread-safe dispatch to main.
+  • TTS on selection (configurable).
+  • Preferences (persisted):
+      - Launch at login
+      - Enable inline capture
+      - Enable global shortcut + Record Shortcut
+      - Speech mode: Inline only / All capture / None
 
 Setup
-  pip install --upgrade pyobjc rumps requests emoji
+  python -m pip install --upgrade pyobjc rumps requests emoji
   export GIPHY_API_KEY="YOUR_KEY"
-  # optional: export EMOTIFI_HOTKEY="CMD+SHIFT+E"
   python emotifi.py
 """
 
-import os, threading, time, difflib, re
+import os, sys, json, threading, time, difflib, re, subprocess
 import requests
 import rumps
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict, Iterable
+from typing import List, Optional, Tuple, Dict
 
 # third-party for emoji dataset
 import emoji  # pip install emoji
@@ -41,6 +39,7 @@ from AppKit import (
     NSWindowStyleMaskTitled,
     NSWindowStyleMaskClosable,
     NSWindowStyleMaskMiniaturizable,
+    NSWindowStyleMaskResizable,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSFloatingWindowLevel,
     NSSegmentedControl,
@@ -68,6 +67,7 @@ from AppKit import (
     NSNotificationCenter,
     NSControlTextDidChangeNotification,
     NSSpeechSynthesizer,
+    NSPopUpButton,
 )
 from Foundation import NSObject, NSURL, NSData, NSIndexSet, NSOperationQueue, NSTimer
 from objc import super as objc_super
@@ -113,26 +113,92 @@ TRIGGER_TOKEN = "::"  # inline trigger
 
 # ---- Shared HTTP session + caches ----
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "Emotifi/2.3"})
+HTTP.headers.update({"User-Agent": "Emotifi/2.4"})
 IMG_CACHE: Dict[str, bytes] = {}     # url -> bytes
 
-# Expose the active input manager to the palette for cleanup
-ACTIVE_INPUT = None
+# ========= Preferences (persisted) =========
+APP_ID = "com.emotifi.app"
+APP_SUPPORT_DIR = os.path.join(os.path.expanduser("~/Library/Application Support"), "Emotifi")
+PREFS_PATH = os.path.join(APP_SUPPORT_DIR, "prefs.json")
+LAUNCH_AGENTS_DIR = os.path.expanduser("~/Library/LaunchAgents")
+LAUNCH_PLIST = os.path.join(LAUNCH_AGENTS_DIR, f"{APP_ID}.plist")
 
-# ---------- Hotkey config helper ----------
-def _hotkey_from_env() -> Tuple[str, int]:
-    spec = os.environ.get("EMOTIFI_HOTKEY", "").strip()
+DEFAULT_PREFS = {
+    "launch_at_login": False,
+    "enable_inline": True,
+    "enable_hotkey": True,
+    "hotkey": "CMD+SHIFT+E",  # human-readable; persisted
+    "tts_mode": "inline",     # one of: "inline", "all", "none"
+}
+
+def _ensure_dir(p):
+    try: os.makedirs(p, exist_ok=True)
+    except Exception: pass
+
+def _read_json(p, default):
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def _write_json(p, obj):
+    tmp = p + ".tmp"
+    _ensure_dir(os.path.dirname(p))
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+    os.replace(tmp, p)
+
+class Prefs:
+    def __init__(self):
+        _ensure_dir(APP_SUPPORT_DIR)
+        self._data = _read_json(PREFS_PATH, DEFAULT_PREFS.copy())
+
+    def get(self, k):
+        return self._data.get(k, DEFAULT_PREFS.get(k))
+
+    def set(self, k, v):
+        self._data[k] = v
+        _write_json(PREFS_PATH, self._data)
+
+    # convenience getters
+    @property
+    def launch_at_login(self): return bool(self.get("launch_at_login"))
+    @property
+    def enable_inline(self): return bool(self.get("enable_inline"))
+    @property
+    def enable_hotkey(self): return bool(self.get("enable_hotkey"))
+    @property
+    def hotkey(self): return str(self.get("hotkey") or "CMD+SHIFT+E")
+    @property
+    def tts_mode(self): 
+        v = str(self.get("tts_mode") or "inline")
+        return v if v in ("inline","all","none") else "inline"
+
+    def update(self, **kwargs):
+        changed = False
+        for k, v in kwargs.items():
+            if self._data.get(k) != v:
+                self._data[k] = v
+                changed = True
+        if changed:
+            _write_json(PREFS_PATH, self._data)
+        return changed
+
+PREFS = Prefs()
+
+def _human_hotkey_to_parts(spec: str) -> Tuple[str, int]:
+    spec = (spec or "").strip().upper().replace(" ", "")
     if not spec:
-        return "e", (NSEventModifierFlagCommand | NSEventModifierFlagShift)
-    spec = spec.replace(" ", "").upper()
+        spec = DEFAULT_PREFS["hotkey"]
     parts = [p for p in spec.split("+") if p]
     mods = 0
     key = None
     for p in parts:
-        if p in ("CMD", "COMMAND"): mods |= NSEventModifierFlagCommand
-        elif p in ("SHIFT", "SHF"): mods |= NSEventModifierFlagShift
-        elif p in ("CTRL", "CONTROL", "CTL"): mods |= NSEventModifierFlagControl
-        elif p in ("OPT", "OPTION", "ALT"): mods |= NSEventModifierFlagOption
+        if p in ("CMD", "COMMAND"): mods |= (NSEventModifierFlagCommand)
+        elif p in ("SHIFT", "SHF"): mods |= (NSEventModifierFlagShift)
+        elif p in ("CTRL", "CONTROL", "CTL"): mods |= (NSEventModifierFlagControl)
+        elif p in ("OPT", "OPTION", "ALT"): mods |= (NSEventModifierFlagOption)
         elif p == "SPACE": key = " "
         elif len(p) == 1: key = p.lower()
         elif p in [";", "'", ",", ".", "/", "\\", "[", "]", "-", "="]: key = p
@@ -140,6 +206,65 @@ def _hotkey_from_env() -> Tuple[str, int]:
     if mods == 0: mods = (NSEventModifierFlagCommand | NSEventModifierFlagShift)
     return key, mods
 
+def _parts_to_human(key: str, mods: int) -> str:
+    pieces = []
+    if mods & NSEventModifierFlagCommand: pieces.append("CMD")
+    if mods & NSEventModifierFlagShift: pieces.append("SHIFT")
+    if mods & NSEventModifierFlagOption: pieces.append("OPT")
+    if mods & NSEventModifierFlagControl: pieces.append("CTRL")
+    if key == " ": pieces.append("SPACE")
+    else: pieces.append(key.upper())
+    return "+".join(pieces)
+
+def _enable_launch_at_login(enable: bool):
+    """
+    Create/remove LaunchAgent to run this script on login.
+    """
+    try:
+        _ensure_dir(LAUNCH_AGENTS_DIR)
+        if enable:
+            python = sys.executable
+            script = os.path.abspath(__file__)
+            plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>{APP_ID}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python}</string>
+        <string>{script}</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>StandardOutPath</key><string>{APP_SUPPORT_DIR}/emotifi.log</string>
+    <key>StandardErrorPath</key><string>{APP_SUPPORT_DIR}/emotifi.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>GIPHY_API_KEY</key><string>{GIPHY_API_KEY}</string>
+    </dict>
+</dict>
+</plist>"""
+            _ensure_dir(APP_SUPPORT_DIR)
+            with open(LAUNCH_PLIST, "w", encoding="utf-8") as f:
+                f.write(plist)
+            try:
+                subprocess.run(["launchctl", "unload", LAUNCH_PLIST], check=False)
+                subprocess.run(["launchctl", "load", LAUNCH_PLIST], check=False)
+            except Exception:
+                pass
+        else:
+            try:
+                subprocess.run(["launchctl", "unload", LAUNCH_PLIST], check=False)
+            except Exception:
+                pass
+            if os.path.exists(LAUNCH_PLIST):
+                os.remove(LAUNCH_PLIST)
+        return True
+    except Exception:
+        return False
+
+# Expose the active input manager to the palette for cleanup
+ACTIVE_INPUT = None
 
 # ---------- Models ----------
 @dataclass
@@ -151,16 +276,8 @@ class ResultItem:
     thumb_url: Optional[str] = None
     media_url: Optional[str] = None
 
-
 # ---------- Emoji search (improved fuzzy matching + synonyms) ----------
 class EmojiSearch:
-    """
-    Builds a lightweight search index over emoji.EMOJI_DATA with:
-      - tokenized name/aliases/keywords
-      - partial matches ('in' and startswith)
-      - fuzzy similarity via difflib
-      - simple synonyms/expansions (e.g., 'tasty' -> 'yum delicious hungry drool savoring food')
-    """
     _SYNONYMS: Dict[str, str] = {
         "tasty": "yum yummy delicious hungry food drool savoring snack dessert sweet tasty",
         "yummy": "yum tasty delicious drool savoring",
@@ -180,9 +297,11 @@ class EmojiSearch:
         "sick": "mask thermometer sneeze vomit",
         "sport": "soccer football basketball cricket tennis run",
         "cricket": "cricket bat ball",
-        "run": "running runner sprint shoe"
+        "run": "running runner sprint shoe",
+        "chai": "tea cup chai hot drink",
+        "biryani": "rice food meal spicy",
+        "pani": "pani puri golgappa chaat"
     }
-
     def __init__(self):
         self.rows: List[Tuple[str, str, str, List[str]]] = []  # (char, name, terms_str, tokens)
         for ch, meta in emoji.EMOJI_DATA.items():
@@ -197,7 +316,6 @@ class EmojiSearch:
             tokens = self._tokenize(terms)
             if terms:
                 self.rows.append((ch, name or ch, terms, tokens))
-
         # Deduplicate by emoji char (keep first)
         seen = set(); uniq = []
         for ch, name, terms, tokens in self.rows:
@@ -215,9 +333,7 @@ class EmojiSearch:
         for w in base:
             if w in self._SYNONYMS:
                 extra += self._tokenize(self._SYNONYMS[w])
-        # Unique, keep order
-        seen = set()
-        out = []
+        seen = set(); out = []
         for w in base + extra:
             if w not in seen:
                 seen.add(w); out.append(w)
@@ -229,48 +345,28 @@ class EmojiSearch:
             q = "heart"
         qwords = self._expand_query(q)
         qjoined = " ".join(qwords)
-
         hits: List[Tuple[float, str, str]] = []  # (score, name, ch)
         for ch, name, terms, tokens in self.rows:
             score = 0.0
-
-            # Exact/substring match boosts
-            if q in terms:
-                score += 6.0
+            if q in terms: score += 6.0
             for w in qwords:
-                if w in terms:
-                    score += 3.0
-                # prefix boosts
-                if any(tok.startswith(w) for tok in tokens):
-                    score += 2.5
-
-            # Fuzzy similarity between query and name/terms (cheap)
+                if w in terms: score += 3.0
+                if any(tok.startswith(w) for tok in tokens): score += 2.5
             try:
                 s1 = difflib.SequenceMatcher(a=qjoined, b=terms).ratio()
-                if s1 >= 0.55:
-                    score += (s1 - 0.5) * 6.0  # up to ~+3
+                if s1 >= 0.55: score += (s1 - 0.5) * 6.0
                 s2 = difflib.SequenceMatcher(a=" ".join(qwords), b=name.lower()).ratio()
-                if s2 >= 0.55:
-                    score += (s2 - 0.5) * 4.0
-            except Exception:
-                pass
-
-            # Short, iconic names (e.g., 'pizza') get a tiny bump
+                if s2 >= 0.55: score += (s2 - 0.5) * 4.0
+            except Exception: pass
             score += max(0.0, 1.5 - 0.2 * len(name.split()))
-
             if score > 0:
                 hits.append((score, name, ch))
-
-        # If nothing matched, try falling back to food/music/sport themed packs for some common words
-        if not hits and any(w in ("tasty", "yum", "yummy", "food", "hungry", "snack") for w in qwords):
+        if not hits and any(w in ("tasty","yum","yummy","food","hungry","snack") for w in qwords):
             for ch, name, terms, tokens in self.rows:
-                if any(w in tokens for w in ["yum", "yummy", "food", "snack", "pizza", "burger", "fries", "noodles", "cookie", "chocolate", "drooling", "savoring"]):
+                if any(w in tokens for w in ["yum","yummy","food","snack","pizza","burger","fries","noodles","cookie","chocolate","drooling","savoring"]):
                     hits.append((1.0, name, ch))
-
         hits.sort(key=lambda x: (-x[0], x[1]))
-        items = [ResultItem("emoji", f"{ch}  {name}", name, ch) for _, name, ch in hits[:limit]]
-        return items
-
+        return [ResultItem("emoji", f"{ch}  {name}", name, ch) for _, name, ch in hits[:limit]]
 
 # ---------- GIPHY search ----------
 class GiphySearch:
@@ -312,7 +408,6 @@ class GiphySearch:
         if not out:
             print(f"[Giphy {self.kind}] empty results for q='{q}'. status={self.last_status}")
         return out
-
 
 # ---------- Paste helpers ----------
 def _activate_app_and_sleep(prev_app):
@@ -361,7 +456,6 @@ def paste_image_from_url_or_fallback(url: Optional[str], prev_app=None) -> bool:
         wrote = False
         if png: wrote = pb.setData_forType_(png, NSPasteboardTypePNG) or wrote
         if tiff: wrote = pb.setData_forType_(tiff, NSPasteboardTypeTIFF) or wrote
-        # paste
         src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState)
         cmd_down = CGEventCreateKeyboardEvent(src, 0x37, True)
         v_down = CGEventCreateKeyboardEvent(src, 0x09, True)
@@ -384,7 +478,6 @@ def backspace(n=1):
         bs_up = CGEventCreateKeyboardEvent(src, 0x33, False)
         CGEventPost(0, bs_down); CGEventPost(0, bs_up)
 
-
 # ---------- Palette window ----------
 class PaletteWindow(NSObject):
     def init(self):
@@ -392,10 +485,10 @@ class PaletteWindow(NSObject):
         if self is None: return None
         self.current_items: List[ResultItem] = []
         self._tts_enabled = False
+        self._tts_policy = PREFS.tts_mode
         self._search_generation = 0
         self._debounce_timer: Optional[threading.Timer] = None
         self._prev_app = None
-        # System default TTS
         self.synth = NSSpeechSynthesizer.alloc().init()
         self.emoji_engine = EmojiSearch()
         self.gif_engine = GiphySearch("gif")
@@ -462,25 +555,6 @@ class PaletteWindow(NSObject):
         self.info.setEditable_(False); self.info.setSelectable_(False)
         content.addSubview_(self.info)
 
-        self.btn_access = NSButton.alloc().initWithFrame_(NSMakeRect(width - 200, height - 78, 180, 24))
-        self.btn_access.setTitle_("Open Accessibility"); self.btn_access.setTarget_(self)
-        self.btn_access.setAction_("openAccessibility:"); content.addSubview_(self.btn_access)
-
-        self.btn_input = NSButton.alloc().initWithFrame_(NSMakeRect(width - 200, height - 110, 180, 24))
-        self.btn_input.setTitle_("Open Input Monitoring"); self.btn_input.setTarget_(self)
-        self.btn_input.setAction_("openInputMon:"); content.addSubview_(self.btn_input)
-
-        # Ensure search gets focus immediately and stays there
-        self.panel.setInitialFirstResponder_(self.search)
-        self.panel.makeFirstResponder_(self.search)
-
-    # Settings deeplinks
-    def openAccessibility_(self, _):
-        NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"))
-    def openInputMon_(self, _):
-        NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"))
-
-    # Actions
     def modeChanged_(self, _): self.performSearch()
     def searchFieldChanged_(self, _): self.performSearch()
     def controlTextDidChange_(self, _): self.performSearch()
@@ -494,7 +568,6 @@ class PaletteWindow(NSObject):
                 keycode = event.keyCode()
                 flags = int(event.modifierFlags())
                 opt_down = (flags & NSEventModifierFlagOption) == NSEventModifierFlagOption
-
                 if keycode == 126:  # ↑
                     self._move_selection(-1); return None
                 if keycode == 125:  # ↓
@@ -520,8 +593,19 @@ class PaletteWindow(NSObject):
         self._update_preview(row)
 
     # Inline capture API — called on main thread
+    def _apply_tts_policy_for_context(self, context: str):
+        mode = PREFS.tts_mode
+        if mode == "none":
+            self._tts_enabled = False
+        elif mode == "all":
+            self._tts_enabled = True
+        elif mode == "inline":
+            self._tts_enabled = (context == "inline")
+        else:
+            self._tts_enabled = (context == "inline")
+
     def inline_begin(self):
-        self._tts_enabled = True
+        self._apply_tts_policy_for_context("inline")
         self._prev_app = NSWorkspace.sharedWorkspace().frontmostApplication()
         NSApp.activateIgnoringOtherApps_(True)
         self.panel.makeKeyAndOrderFront_(None)
@@ -530,7 +614,7 @@ class PaletteWindow(NSObject):
         NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(0.02, self, "refocusTimer:", None, False)
         self.performSearch()
 
-    def refocusTimer_(self, _):  # called by NSTimer
+    def refocusTimer_(self, _):
         try: self.panel.makeFirstResponder_(self.search)
         except Exception: pass
 
@@ -543,7 +627,6 @@ class PaletteWindow(NSObject):
         if s:
             self.search.setStringValue_(s[:-1]); self.performSearch()
 
-    # Table clicks insert immediately
     def rowClicked_(self, _):
         row = self.table.clickedRow()
         if row >= 0:
@@ -557,20 +640,16 @@ class PaletteWindow(NSObject):
         except Exception:
             return "emoji"
 
-    # Search logic (debounced for network kinds)
     def performSearch(self):
         q = self.search.stringValue()
         mode = self._current_mode()
-
         if mode == "emoji":
             items = self.emoji_engine.search(q)
             self._apply_results_on_main(items, hint=("No emoji found." if not items else ""))
             return
-
         if self._debounce_timer: self._debounce_timer.cancel()
         self._search_generation += 1
         gen = self._search_generation
-
         def fire():
             engine = self.gif_engine if mode == "gif" else self.sticker_engine
             items = engine.search(q)
@@ -579,7 +658,6 @@ class PaletteWindow(NSObject):
                 if gen == self._search_generation:
                     self._apply_results(items, hint)
             NSOperationQueue.mainQueue().addOperationWithBlock_(apply)
-
         self._debounce_timer = threading.Timer(0.22, fire)
         self._debounce_timer.daemon = True
         self._debounce_timer.start()
@@ -606,7 +684,6 @@ class PaletteWindow(NSObject):
             self.preview.setImage_(None)
             self.info.setStringValue_(hint or "No results.")
 
-    # Table datasource/delegate
     def numberOfRowsInTableView_(self, _): return len(self.current_items)
     def tableView_objectValueForTableColumn_row_(self, _, __, row):
         try:
@@ -618,7 +695,6 @@ class PaletteWindow(NSObject):
             self._speak_selection(row)
             self._update_preview(row)
 
-    # TTS (system default voice), inline only
     def _speak_selection(self, row: int):
         if not self._tts_enabled: return
         try:
@@ -630,7 +706,6 @@ class PaletteWindow(NSObject):
         except Exception:
             pass
 
-    # Preview (cached)
     def _update_preview(self, row: int):
         try:
             it = self.current_items[row]
@@ -669,21 +744,16 @@ class PaletteWindow(NSObject):
             it = self.current_items[row]
             prev = self._prev_app
             self.hide()
-
-            # Clean up inline text (stray ':' or '::query')
             try:
                 if ACTIVE_INPUT:
                     ACTIVE_INPUT.inline_cleanup_on_insert()
             except Exception:
                 pass
-
-            # NEW: Always backspace once right before paste if palette was opened via '::'
             try:
                 if ACTIVE_INPUT and getattr(ACTIVE_INPUT, "last_triggered_inline", False):
                     backspace(1)
             except Exception:
                 pass
-
             def do_paste():
                 if it.kind == "emoji":
                     insert_text_via_keystroke_paste(it.insert_text, prev_app=prev)
@@ -694,7 +764,6 @@ class PaletteWindow(NSObject):
                         ok = paste_image_from_url_or_fallback(it.media_url or it.thumb_url or it.insert_text, prev_app=prev)
                         if not ok:
                             insert_text_via_keystroke_paste(it.media_url or it.insert_text, prev_app=prev)
-                # reset inline flag after the insert
                 try:
                     if ACTIVE_INPUT:
                         ACTIVE_INPUT.last_triggered_inline = False
@@ -702,13 +771,11 @@ class PaletteWindow(NSObject):
                     pass
             threading.Thread(target=do_paste, daemon=True).start()
 
-
 # ---------- Global input (hotkey + inline capture) ----------
 class GlobalInput:
     """
-    A) Global hotkey (default ⌘⇧E) via Cocoa monitors (global + local)
-    B) Inline '::' capture via CGEvent tap (preferred) or NSEvent fallback.
-       UI calls are dispatched to the main thread. Adds colon clean-up.
+    A) Global hotkey via Cocoa monitors (global + local) — configurable.
+    B) Inline '::' capture via CGEvent tap (preferred) or NSEvent fallback — configurable.
     """
     def __init__(self, on_hotkey, palette: PaletteWindow):
         self.on_hotkey = on_hotkey
@@ -719,15 +786,15 @@ class GlobalInput:
         self._nsevent_monitor = None
         self._hotkey_monitor_global = None
         self._hotkey_monitor_local = None
-        self._wanted_key, self._wanted_mods = _hotkey_from_env()
+        self._wanted_key, self._wanted_mods = _human_hotkey_to_parts(PREFS.hotkey)
         self.using_tap = False
         self.capturing = False
         self.capture_len = 0
         self.fallback_cleanup = False
-        # NEW: track whether this session was triggered by inline '::'
         self.last_triggered_inline = False
+        self._hotkey_enabled = PREFS.enable_hotkey
+        self._inline_enabled = PREFS.enable_inline
 
-    # ---- hotkey helpers ----
     def _mods_match(self, flags: int) -> bool:
         mask = (NSEventModifierFlagCommand | NSEventModifierFlagShift |
                 NSEventModifierFlagControl | NSEventModifierFlagOption)
@@ -741,39 +808,49 @@ class GlobalInput:
         if self._wanted_key == " ": return key == " "
         return key and key[0] == self._wanted_key
 
-    def start_hotkey(self):
-        """Start global+local monitors; always dispatch on_hotkey to main thread."""
-        def fire_on_main():
-            try:
-                NSOperationQueue.mainQueue().addOperationWithBlock_(self.on_hotkey)
-            except Exception:
-                pass
+    def _fire_on_main(self):
+        try: NSOperationQueue.mainQueue().addOperationWithBlock_(self.on_hotkey)
+        except Exception: pass
 
+    def start_hotkey(self):
+        if not self._hotkey_enabled:
+            return
         def handler_global(ns_event):
             try:
                 if self._mods_match(int(ns_event.modifierFlags())) and self._key_match(ns_event):
-                    fire_on_main()   # ensure UI on main thread
-            except Exception:
-                pass
-
-        self._hotkey_monitor_global = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-            NSEventMaskKeyDown, handler_global
-        )
+                    self._fire_on_main()
+            except Exception: pass
+        self._hotkey_monitor_global = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(NSEventMaskKeyDown, handler_global)
 
         def handler_local(ns_event):
             try:
                 if self._mods_match(int(ns_event.modifierFlags())) and self._key_match(ns_event):
-                    fire_on_main()   # ensure UI on main thread
-                    return None       # swallow locally
-            except Exception:
-                pass
+                    self._fire_on_main()
+                    return None
+            except Exception: pass
             return ns_event
+        self._hotkey_monitor_local = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(NSEventMaskKeyDown, handler_local)
 
-        self._hotkey_monitor_local = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
-            NSEventMaskKeyDown, handler_local
-        )
+    def stop_hotkey(self):
+        try:
+            if self._hotkey_monitor_local:
+                NSEvent.removeMonitor_(self._hotkey_monitor_local)
+        except Exception: pass
+        try:
+            if self._hotkey_monitor_global:
+                NSEvent.removeMonitor_(self._hotkey_monitor_global)
+        except Exception: pass
+        self._hotkey_monitor_local = None
+        self._hotkey_monitor_global = None
 
-    # ---- inline helpers ----
+    def reconfigure_hotkey(self, enabled: bool, human_spec: Optional[str]=None):
+        self.stop_hotkey()
+        self._hotkey_enabled = enabled
+        if human_spec:
+            self._wanted_key, self._wanted_mods = _human_hotkey_to_parts(human_spec)
+        if enabled:
+            self.start_hotkey()
+
     def _on_main(self, fn):
         NSOperationQueue.mainQueue().addOperationWithBlock_(fn)
 
@@ -796,14 +873,16 @@ class GlobalInput:
         return ""
 
     def _start_capture(self, erase_two=True, via_tap=False):
+        if not self._inline_enabled:
+            return
         self.using_tap = via_tap
         self.capturing = True
         self.capture_len = 0
         self.fallback_cleanup = not via_tap
-        self.last_triggered_inline = True  # mark inline session
+        self.last_triggered_inline = True
         if erase_two:
-            backspace(2)         # erase '::'
-            threading.Timer(0.02, lambda: backspace(1)).start()  # extra guard
+            backspace(2)
+            threading.Timer(0.02, lambda: backspace(1)).start()
         print("[INLINE] capture started (tap=%s)" % via_tap)
         self._on_main(lambda: self.palette.inline_begin())
 
@@ -845,8 +924,9 @@ class GlobalInput:
             return None
         return ch
 
-    # CGEvent tap path (best)
     def _start_cgeventtap(self):
+        if not self._inline_enabled:
+            return False
         def callback(_proxy, etype, event, _refcon):
             try:
                 if etype == Quartz.kCGEventKeyDown:
@@ -857,7 +937,7 @@ class GlobalInput:
                     for ch in chars:
                         res = self._push_and_check(ch, erase=True, via_tap=True)
                         if res is None:
-                            return None  # swallow
+                            return None
             except Exception:
                 pass
             return event
@@ -875,8 +955,9 @@ class GlobalInput:
         CFRunLoopRun()
         return True
 
-    # NSEvent fallback (cannot swallow)
     def _start_nsevent_monitor(self):
+        if not self._inline_enabled:
+            return
         def handler(ns_event):
             try:
                 s = ns_event.characters() or ""
@@ -892,15 +973,11 @@ class GlobalInput:
         print("[INLINE] NSEvent monitor active (no swallow). Type :: then query; we’ll clean on insert/cancel).")
 
     def inline_cleanup_on_insert(self):
-        """
-        Called by the palette right before inserting.
-        Ensures any leaked '::query' (fallback) or stray ':' (tap race) is removed.
-        """
         if self.capturing:
             if not self.using_tap:
-                backspace(2 + self.capture_len)   # NSEvent fallback: remove '::' + query
+                backspace(2 + self.capture_len)
             else:
-                backspace(1)                       # Tap path: defensively remove one stray ':'
+                backspace(1)
             self.capturing = False
             self.capture_len = 0
             self.fallback_cleanup = False
@@ -911,7 +988,6 @@ class GlobalInput:
         except Exception:
             pass
 
-        # start hotkey monitors (now thread-safe)
         self.start_hotkey()
 
         def run_tap():
@@ -920,7 +996,7 @@ class GlobalInput:
                 ok = self._start_cgeventtap()
             except Exception:
                 ok = False
-            if not ok:
+            if not ok and self._inline_enabled:
                 print("[WARN] CGEventTap unavailable. Enable Accessibility & Input Monitoring for your venv Python and Terminal/VSCode.")
                 try:
                     self._start_nsevent_monitor()
@@ -928,32 +1004,225 @@ class GlobalInput:
                     print("[ERROR] NSEvent fallback failed. Permissions needed.")
         threading.Thread(target=run_tap, daemon=True).start()
 
+    def set_inline_enabled(self, enabled: bool):
+        self._inline_enabled = enabled
+        if not enabled:
+            try:
+                if self._nsevent_monitor:
+                    NSEvent.removeMonitor_(self._nsevent_monitor)
+            except Exception:
+                pass
+            self._nsevent_monitor = None
+
+# ---------- Preferences UI ----------
+class PreferencesPanel(NSObject):
+    def initWithOwner_(self, owner):
+        self = objc_super(PreferencesPanel, self).init()
+        if self is None: return None
+        self.owner = owner  # MenuApp
+        self._build_panel()
+        self._recording = False
+        self._record_monitor = None
+        return self
+
+    def _build_panel(self):
+        w, h = 520, 300
+        frame = NSScreen.mainScreen().frame()
+        x = frame.size.width / 2 - w / 2
+        y = frame.size.height / 2 - h / 2
+        self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(x, y, w, h),
+            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
+            2, True,
+        )
+        self.panel.setTitle_("Emotifi Preferences")
+        self.panel.setLevel_(NSFloatingWindowLevel)
+        self.panel.setCollectionBehavior_(NSWindowCollectionBehaviorCanJoinAllSpaces)
+
+        content = self.panel.contentView()
+
+        y_cursor = h - 60
+
+        def label(text, x=20, y=None, w=200, hh=22):
+            t = NSTextField.alloc().initWithFrame_(NSMakeRect(x, y if y is not None else y_cursor, w, hh))
+            t.setStringValue_(text)
+            t.setBezeled_(False); t.setDrawsBackground_(False)
+            t.setEditable_(False); t.setSelectable_(False)
+            content.addSubview_(t)
+            return t
+
+        # checkbox helper using tag map (no custom attrs on Cocoa objects)
+        self._pref_map: Dict[int, str] = {}
+        self._next_tag = 1
+        def checkbox(title, x, y, key):
+            btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, 260, 24))
+            btn.setButtonType_(3)  # checkbox
+            btn.setTitle_(title)
+            btn.setState_(1 if PREFS.get(key) else 0)
+            btn.setTarget_(self)
+            btn.setAction_("togglePref:")
+            btn.setTag_(self._next_tag)
+            self._pref_map[self._next_tag] = key
+            self._next_tag += 1
+            content.addSubview_(btn)
+            return btn
+
+        # Launch at login
+        self.chk_login  = checkbox("Launch at login",               20, y_cursor, "launch_at_login"); y_cursor -= 36
+        # Inline capture
+        self.chk_inline = checkbox("Enable inline capture (“::”)",  20, y_cursor, "enable_inline");   y_cursor -= 36
+        # Hotkey enable + display
+        self.chk_hotkey = checkbox("Enable global shortcut",        20, y_cursor, "enable_hotkey");   y_cursor -= 36
+
+        label("Shortcut:", 40, y_cursor)
+        self.shortcut_field = NSTextField.alloc().initWithFrame_(NSMakeRect(110, y_cursor-2, 180, 24))
+        self.shortcut_field.setStringValue_(PREFS.hotkey)
+        self.shortcut_field.setEditable_(False); self.shortcut_field.setBezeled_(True)
+        content.addSubview_(self.shortcut_field)
+
+        self.btn_record = NSButton.alloc().initWithFrame_(NSMakeRect(300, y_cursor-4, 100, 28))
+        self.btn_record.setTitle_("Record")
+        self.btn_record.setTarget_(self); self.btn_record.setAction_("recordShortcut:")
+        content.addSubview_(self.btn_record)
+
+        self.btn_clear = NSButton.alloc().initWithFrame_(NSMakeRect(410, y_cursor-4, 80, 28))
+        self.btn_clear.setTitle_("Clear")
+        self.btn_clear.setTarget_(self); self.btn_clear.setAction_("clearShortcut:")
+        content.addSubview_(self.btn_clear)
+        y_cursor -= 40
+
+        # Speech mode
+        label("Speech mode:", 20, y_cursor)
+        self.popup_tts = NSPopUpButton.alloc().initWithFrame_(NSMakeRect(120, y_cursor-4, 180, 26))
+        self.popup_tts.addItemsWithTitles_(["Inline only", "All capture", "None"])
+        current = PREFS.tts_mode
+        idx = {"inline":0, "all":1, "none":2}.get(current, 0)
+        self.popup_tts.selectItemAtIndex_(idx)
+        self.popup_tts.setTarget_(self); self.popup_tts.setAction_("changedTTS:")
+        content.addSubview_(self.popup_tts)
+
+        # Footer hint
+        y_cursor -= 50
+        label("Changes are saved immediately.", 20, y_cursor, 380, 20)
+
+    # Actions
+    def togglePref_(self, sender):
+        try:
+            tag = int(sender.tag())
+            key = self._pref_map.get(tag)
+            if not key:
+                return
+            val = bool(sender.state())
+            PREFS.set(key, val)
+            if key == "launch_at_login":
+                _enable_launch_at_login(val)
+            elif key == "enable_inline":
+                self.owner.input.set_inline_enabled(val)
+            elif key == "enable_hotkey":
+                self.owner.input.reconfigure_hotkey(val, None)
+        except Exception:
+            pass
+
+    def changedTTS_(self, _):
+        idx = int(self.popup_tts.indexOfSelectedItem())
+        mode = {0:"inline", 1:"all", 2:"none"}.get(idx, "inline")
+        PREFS.set("tts_mode", mode)
+
+    def recordShortcut_(self, _):
+        if getattr(self, "_recording", False):
+            return
+        self._recording = True
+        self.btn_record.setTitle_("Recording…")
+        self.shortcut_field.setStringValue_("Press keys…")
+
+        def handler(ns_event):
+            try:
+                flags = int(ns_event.modifierFlags())
+                key = (ns_event.charactersIgnoringModifiers() or "").lower()
+                if not key:
+                    return None
+                if len(key) > 1 and key != " ":
+                    key = key[0]
+                mods = 0
+                if flags & NSEventModifierFlagCommand: mods |= NSEventModifierFlagCommand
+                if flags & NSEventModifierFlagShift: mods |= NSEventModifierFlagShift
+                if flags & NSEventModifierFlagOption: mods |= NSEventModifierFlagOption
+                if flags & NSEventModifierFlagControl: mods |= NSEventModifierFlagControl
+                human = _parts_to_human(key, mods)
+                self.shortcut_field.setStringValue_(human)
+                PREFS.set("hotkey", human)
+                if PREFS.enable_hotkey:
+                    self.owner.input.reconfigure_hotkey(True, human)
+            except Exception:
+                pass
+            finally:
+                try:
+                    if self._record_monitor:
+                        NSEvent.removeMonitor_(self._record_monitor)
+                except Exception:
+                    pass
+                self._record_monitor = None
+                self._recording = False
+                self.btn_record.setTitle_("Record")
+            return None
+
+        self._record_monitor = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(NSEventMaskKeyDown, handler)
+
+    def clearShortcut_(self, _):
+        human = DEFAULT_PREFS["hotkey"]
+        self.shortcut_field.setStringValue_(human)
+        PREFS.set("hotkey", human)
+        if PREFS.enable_hotkey:
+            self.owner.input.reconfigure_hotkey(True, human)
+
+    def show(self):
+        NSApp.activateIgnoringOtherApps_(True)
+        self.panel.makeKeyAndOrderFront_(None)
 
 # ---------- Menubar app ----------
 class MenuApp(rumps.App):
     def __init__(self):
         super().__init__("🎛️", title="")
         self.palette = PaletteWindow.alloc().init()
+        self.prefs_ui = PreferencesPanel.alloc().initWithOwner_(self)
         self.menu = [
             rumps.MenuItem("Open Palette (⌘⇧E or '::')", callback=self.open_palette_hotkey),
-            rumps.MenuItem("Open Accessibility Settings", callback=lambda _: self.palette.openAccessibility_(None)),
-            rumps.MenuItem("Open Input Monitoring", callback=lambda _: self.palette.openInputMon_(None)),
+            rumps.MenuItem("Preferences…", callback=self.open_prefs),
+            None,
+            rumps.MenuItem("Open Accessibility Settings", callback=lambda _: self._open_access()),
+            rumps.MenuItem("Open Input Monitoring", callback=lambda _: self._open_inputmon()),
+            None,
             rumps.MenuItem("Quit", callback=self.quit_app),
         ]
         self.input = GlobalInput(self.open_palette_hotkey, self.palette)
         self.input.start()
 
-        # Expose input manager globally so the palette can call cleanup on insert
+        if PREFS.launch_at_login and not os.path.exists(LAUNCH_PLIST):
+            _enable_launch_at_login(True)
+
         global ACTIVE_INPUT
         ACTIVE_INPUT = self.input
 
+    def _open_access(self):
+        try:
+            NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"))
+        except Exception:
+            pass
+
+    def _open_inputmon(self):
+        try:
+            NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"))
+        except Exception:
+            pass
+
+    def open_prefs(self, *_):
+        self.prefs_ui.show()
+
     def open_palette_hotkey(self, *_):
-        # Always hop to main thread; hotkey may come from a non-UI thread.
         NSOperationQueue.mainQueue().addOperationWithBlock_(self._open_palette_main)
 
     def _open_palette_main(self):
-        # Show the palette and focus search. No return value (void) to satisfy PyObjC block expectations.
-        self.palette._tts_enabled = False
+        self.palette._apply_tts_policy_for_context("hotkey")
         self.palette._prev_app = NSWorkspace.sharedWorkspace().frontmostApplication()
         NSApp.activateIgnoringOtherApps_(True)
         self.palette.panel.makeKeyAndOrderFront_(None)
@@ -961,7 +1230,6 @@ class MenuApp(rumps.App):
         self.palette.performSearch()
 
     def _focus_search_delayed(self):
-        # Put focus immediately and then once more on the main queue shortly after.
         try:
             self.palette.panel.makeFirstResponder_(self.palette.search)
         except Exception:
@@ -975,7 +1243,6 @@ class MenuApp(rumps.App):
 
     def quit_app(self, *_):
         rumps.quit_application()
-
 
 # ---------- Bootstrap ----------
 if __name__ == "__main__":
