@@ -8,13 +8,13 @@ This build:
   • Focus always lands on Search (immediate + delayed first-responder fix).
   • Inline '::' capture with CGEvent tap (preferred) or NSEvent fallback.
   • Guaranteed cleanup of stray ':' or leaked '::query' on insert.
-  • EXTRA: If inserting an EMOJI after an inline trigger, press Backspace twice
-           right before pasting (per your request).
+  • NEW: If palette was opened via '::', press Backspace once right before pasting
+         for emoji, GIFs, and stickers (fixes lingering ':' in some apps).
   • Arrow keys navigate even when the search field is focused.
   • System TTS via NSSpeechSynthesizer (inline mode only).
   • Click-to-insert with true paste; GIF/Sticker preview + caching.
-  • FIX: Global hotkey (⌘⇧E) handler always dispatches UI to main thread.
-  • FIX: No-return-value block for main-queue refocus (prevents OC_PythonException).
+  • FIX: Global hotkey (⌘⇧E) dispatches UI to main thread.
+  • Emoji search: fuzzier matching + synonyms mapping (e.g., 'tasty' finds 😋 🤤 🍕).
 
 Setup
   pip install --upgrade pyobjc rumps requests emoji
@@ -23,12 +23,12 @@ Setup
   python emotifi.py
 """
 
-import os, threading, time
+import os, threading, time, difflib, re
 import requests
 import rumps
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Iterable
 
 # third-party for emoji dataset
 import emoji  # pip install emoji
@@ -152,41 +152,124 @@ class ResultItem:
     media_url: Optional[str] = None
 
 
-# ---------- Emoji search (full dataset from `emoji`) ----------
+# ---------- Emoji search (improved fuzzy matching + synonyms) ----------
 class EmojiSearch:
+    """
+    Builds a lightweight search index over emoji.EMOJI_DATA with:
+      - tokenized name/aliases/keywords
+      - partial matches ('in' and startswith)
+      - fuzzy similarity via difflib
+      - simple synonyms/expansions (e.g., 'tasty' -> 'yum delicious hungry drool savoring food')
+    """
+    _SYNONYMS: Dict[str, str] = {
+        "tasty": "yum yummy delicious hungry food drool savoring snack dessert sweet tasty",
+        "yummy": "yum tasty delicious drool savoring",
+        "hungry": "food eat meal fork knife burger pizza noodles hungry",
+        "love": "heart hearts like affection kiss romance",
+        "money": "cash dollar bank coin rich bag",
+        "laugh": "lol rofl joy tears happy funny",
+        "music": "note melody song headphones guitar piano",
+        "work": "laptop briefcase office tie chart",
+        "travel": "plane flight passport globe beach suitcase",
+        "rain": "umbrella cloud drop storm thunder",
+        "food": "pizza burger fries noodles taco ramen cake cookie chocolate",
+        "party": "tada balloon confetti birthday cake party",
+        "happy": "smile grin joy blush sunshine",
+        "sad": "cry frown disappointed",
+        "angry": "mad rage angry pouting",
+        "sick": "mask thermometer sneeze vomit",
+        "sport": "soccer football basketball cricket tennis run",
+        "cricket": "cricket bat ball",
+        "run": "running runner sprint shoe"
+    }
+
     def __init__(self):
-        # Build a search index from emoji.EMOJI_DATA
-        self.rows = []  # (char, name, terms)
+        self.rows: List[Tuple[str, str, str, List[str]]] = []  # (char, name, terms_str, tokens)
         for ch, meta in emoji.EMOJI_DATA.items():
             name = (meta.get("en") or meta.get("name") or "").replace(":", " ").strip()
             aliases = meta.get("alias", []) or meta.get("aliases", []) or []
             kw = meta.get("keywords", []) or meta.get("kw", []) or meta.get("tags", []) or []
-            terms = " ".join([name] + [a.replace("_", " ") for a in aliases] + [k.replace("_", " ") for k in kw]).lower()
-            if name or terms:
-                self.rows.append((ch, name or ch, terms))
-        # dedupe by char
+            pieces: List[str] = []
+            if name: pieces.append(name)
+            pieces += [a.replace("_", " ") for a in aliases]
+            pieces += [k.replace("_", " ") for k in kw]
+            terms = " ".join(pieces).lower().strip()
+            tokens = self._tokenize(terms)
+            if terms:
+                self.rows.append((ch, name or ch, terms, tokens))
+
+        # Deduplicate by emoji char (keep first)
         seen = set(); uniq = []
-        for ch, name, terms in self.rows:
+        for ch, name, terms, tokens in self.rows:
             if ch in seen: continue
-            seen.add(ch); uniq.append((ch, name, terms))
+            seen.add(ch); uniq.append((ch, name, terms, tokens))
         self.rows = uniq
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        return [t for t in re.split(r"[^a-z0-9+]+", text.lower()) if t]
+
+    def _expand_query(self, q: str) -> List[str]:
+        base = self._tokenize(q)
+        extra: List[str] = []
+        for w in base:
+            if w in self._SYNONYMS:
+                extra += self._tokenize(self._SYNONYMS[w])
+        # Unique, keep order
+        seen = set()
+        out = []
+        for w in base + extra:
+            if w not in seen:
+                seen.add(w); out.append(w)
+        return out
 
     def search(self, q: str, limit: int = 120) -> List[ResultItem]:
         q = (q or "").strip().lower()
-        if not q: q = "heart"
-        qwords = [w for w in q.split() if w]
-        hits = []
-        for ch, name, terms in self.rows:
-            score = 0
-            if q in terms: score += 5
+        if not q:
+            q = "heart"
+        qwords = self._expand_query(q)
+        qjoined = " ".join(qwords)
+
+        hits: List[Tuple[float, str, str]] = []  # (score, name, ch)
+        for ch, name, terms, tokens in self.rows:
+            score = 0.0
+
+            # Exact/substring match boosts
+            if q in terms:
+                score += 6.0
             for w in qwords:
-                if any(t.startswith(w) for t in terms.split()): score += 3
-                elif w in terms: score += 1
+                if w in terms:
+                    score += 3.0
+                # prefix boosts
+                if any(tok.startswith(w) for tok in tokens):
+                    score += 2.5
+
+            # Fuzzy similarity between query and name/terms (cheap)
+            try:
+                s1 = difflib.SequenceMatcher(a=qjoined, b=terms).ratio()
+                if s1 >= 0.55:
+                    score += (s1 - 0.5) * 6.0  # up to ~+3
+                s2 = difflib.SequenceMatcher(a=" ".join(qwords), b=name.lower()).ratio()
+                if s2 >= 0.55:
+                    score += (s2 - 0.5) * 4.0
+            except Exception:
+                pass
+
+            # Short, iconic names (e.g., 'pizza') get a tiny bump
+            score += max(0.0, 1.5 - 0.2 * len(name.split()))
+
             if score > 0:
-                score += max(0, 2 - len(name.split()))
                 hits.append((score, name, ch))
+
+        # If nothing matched, try falling back to food/music/sport themed packs for some common words
+        if not hits and any(w in ("tasty", "yum", "yummy", "food", "hungry", "snack") for w in qwords):
+            for ch, name, terms, tokens in self.rows:
+                if any(w in tokens for w in ["yum", "yummy", "food", "snack", "pizza", "burger", "fries", "noodles", "cookie", "chocolate", "drooling", "savoring"]):
+                    hits.append((1.0, name, ch))
+
         hits.sort(key=lambda x: (-x[0], x[1]))
-        return [ResultItem("emoji", f"{ch}  {name}", name, ch) for _, name, ch in hits[:limit]]
+        items = [ResultItem("emoji", f"{ch}  {name}", name, ch) for _, name, ch in hits[:limit]]
+        return items
 
 
 # ---------- GIPHY search ----------
@@ -594,11 +677,10 @@ class PaletteWindow(NSObject):
             except Exception:
                 pass
 
-            # EXTRA: if this was an inline-triggered insert AND it's an emoji,
-            # press Backspace twice right before pasting (per your request).
+            # NEW: Always backspace once right before paste if palette was opened via '::'
             try:
-                if ACTIVE_INPUT and getattr(ACTIVE_INPUT, "last_triggered_inline", False) and it.kind == "emoji":
-                    backspace(2)
+                if ACTIVE_INPUT and getattr(ACTIVE_INPUT, "last_triggered_inline", False):
+                    backspace(1)
             except Exception:
                 pass
 
@@ -884,13 +966,11 @@ class MenuApp(rumps.App):
             self.palette.panel.makeFirstResponder_(self.palette.search)
         except Exception:
             pass
-        # Use a block that returns None; no lambda that returns a bool
         def _refocus_block():
             try:
                 self.palette.panel.makeFirstResponder_(self.palette.search)
             except Exception:
                 pass
-            # no return (implicit None)
         NSOperationQueue.mainQueue().addOperationWithBlock_(_refocus_block)
 
     def quit_app(self, *_):
