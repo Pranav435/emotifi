@@ -14,11 +14,10 @@ This build:
       - Enable inline capture
       - Enable global shortcut + Record Shortcut
       - Speech mode: Inline only / All capture / None
-
-Setup
-  python -m pip install --upgrade pyobjc rumps requests emoji
-  export GIPHY_API_KEY="YOUR_KEY"
-  python emotifi.py
+  • UI polish:
+      - Removed “Accessibility/Input Monitoring” buttons & extra menu clutter
+      - Single Quit item (no duplicates)
+      - Cleaner Preferences layout with section headers & helper text
 """
 
 import os, sys, json, threading, time, difflib, re, subprocess
@@ -68,6 +67,8 @@ from AppKit import (
     NSControlTextDidChangeNotification,
     NSSpeechSynthesizer,
     NSPopUpButton,
+    NSBox,
+    NSBezelStyleRounded,
 )
 from Foundation import NSObject, NSURL, NSData, NSIndexSet, NSOperationQueue, NSTimer
 from objc import super as objc_super
@@ -113,7 +114,7 @@ TRIGGER_TOKEN = "::"  # inline trigger
 
 # ---- Shared HTTP session + caches ----
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "Emotifi/2.4"})
+HTTP.headers.update({"User-Agent": "Emotifi/2.5"})
 IMG_CACHE: Dict[str, bytes] = {}     # url -> bytes
 
 # ========= Preferences (persisted) =========
@@ -161,7 +162,6 @@ class Prefs:
         self._data[k] = v
         _write_json(PREFS_PATH, self._data)
 
-    # convenience getters
     @property
     def launch_at_login(self): return bool(self.get("launch_at_login"))
     @property
@@ -174,16 +174,6 @@ class Prefs:
     def tts_mode(self): 
         v = str(self.get("tts_mode") or "inline")
         return v if v in ("inline","all","none") else "inline"
-
-    def update(self, **kwargs):
-        changed = False
-        for k, v in kwargs.items():
-            if self._data.get(k) != v:
-                self._data[k] = v
-                changed = True
-        if changed:
-            _write_json(PREFS_PATH, self._data)
-        return changed
 
 PREFS = Prefs()
 
@@ -217,9 +207,7 @@ def _parts_to_human(key: str, mods: int) -> str:
     return "+".join(pieces)
 
 def _enable_launch_at_login(enable: bool):
-    """
-    Create/remove LaunchAgent to run this script on login.
-    """
+    """Create/remove LaunchAgent to run this script on login (good for dev builds)."""
     try:
         _ensure_dir(LAUNCH_AGENTS_DIR)
         if enable:
@@ -227,23 +215,14 @@ def _enable_launch_at_login(enable: bool):
             script = os.path.abspath(__file__)
             plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
+<plist version="1.0"><dict>
     <key>Label</key><string>{APP_ID}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{python}</string>
-        <string>{script}</string>
-    </array>
+    <key>ProgramArguments</key><array><string>{python}</string><string>{script}</string></array>
     <key>RunAtLoad</key><true/>
     <key>StandardOutPath</key><string>{APP_SUPPORT_DIR}/emotifi.log</string>
     <key>StandardErrorPath</key><string>{APP_SUPPORT_DIR}/emotifi.err</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>GIPHY_API_KEY</key><string>{GIPHY_API_KEY}</string>
-    </dict>
-</dict>
-</plist>"""
+    <key>EnvironmentVariables</key><dict><key>GIPHY_API_KEY</key><string>{GIPHY_API_KEY}</string></dict>
+</dict></plist>"""
             _ensure_dir(APP_SUPPORT_DIR)
             with open(LAUNCH_PLIST, "w", encoding="utf-8") as f:
                 f.write(plist)
@@ -257,8 +236,7 @@ def _enable_launch_at_login(enable: bool):
                 subprocess.run(["launchctl", "unload", LAUNCH_PLIST], check=False)
             except Exception:
                 pass
-            if os.path.exists(LAUNCH_PLIST):
-                os.remove(LAUNCH_PLIST)
+            if os.path.exists(LAUNCH_PLIST): os.remove(LAUNCH_PLIST)
         return True
     except Exception:
         return False
@@ -316,7 +294,6 @@ class EmojiSearch:
             tokens = self._tokenize(terms)
             if terms:
                 self.rows.append((ch, name or ch, terms, tokens))
-        # Deduplicate by emoji char (keep first)
         seen = set(); uniq = []
         for ch, name, terms, tokens in self.rows:
             if ch in seen: continue
@@ -497,10 +474,9 @@ class PaletteWindow(NSObject):
         self._install_key_monitor_for_panel()
         return self
 
-    # --- UI ---
     def _build_ui(self):
         frame = NSScreen.mainScreen().frame()
-        width, height = 560, 440
+        width, height = 560, 420
         x = frame.size.width / 2 - width / 2
         y = frame.size.height / 2 - height / 2
         self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
@@ -508,13 +484,20 @@ class PaletteWindow(NSObject):
             NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable,
             2, True,
         )
-        self.panel.setTitle_("Emoji • GIF • Sticker")
+        self.panel.setTitle_("Emotifi — Emoji • GIF • Sticker")
         self.panel.setLevel_(NSFloatingWindowLevel)
         self.panel.setCollectionBehavior_(NSWindowCollectionBehaviorCanJoinAllSpaces)
 
         content = self.panel.contentView()
 
-        self.mode_seg = NSSegmentedControl.alloc().initWithFrame_(NSMakeRect(12, height - 44, 260, 24))
+        # Header help text
+        header = NSTextField.alloc().initWithFrame_(NSMakeRect(12, height - 48, width - 24, 20))
+        header.setStringValue_("Tip: Type to search • ↑/↓ to navigate • ⏎ to insert • ⌥⏎ to insert link • Esc to close")
+        header.setBezeled_(False); header.setDrawsBackground_(False)
+        header.setEditable_(False); header.setSelectable_(False)
+        content.addSubview_(header)
+
+        self.mode_seg = NSSegmentedControl.alloc().initWithFrame_(NSMakeRect(12, height - 74, 260, 24))
         self.mode_seg.setSegmentCount_(3)
         self.mode_seg.setLabel_forSegment_("Emoji", 0)
         self.mode_seg.setLabel_forSegment_("GIFs", 1)
@@ -526,8 +509,8 @@ class PaletteWindow(NSObject):
         self.mode_seg.setTarget_(self); self.mode_seg.setAction_("modeChanged:")
         content.addSubview_(self.mode_seg)
 
-        self.search = NSSearchField.alloc().initWithFrame_(NSMakeRect(280, height - 46, width - 292, 28))
-        self.search.setPlaceholderString_("Search…  ↑/↓: navigate   ⏎: insert   ⌥⏎: link   Esc: close")
+        self.search = NSSearchField.alloc().initWithFrame_(NSMakeRect(280, height - 78, width - 292, 28))
+        self.search.setPlaceholderString_("Search…")
         try: self.search.setContinuous_(True)
         except Exception: pass
         self.search.setTarget_(self); self.search.setAction_("searchFieldChanged:")
@@ -537,7 +520,7 @@ class PaletteWindow(NSObject):
         )
         content.addSubview_(self.search)
 
-        self.scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(12, 40, width - 220, height - 100))
+        self.scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(12, 40, width - 220, height - 130))
         self.scroll.setHasVerticalScroller_(True)
         self.table = NSTableView.alloc().initWithFrame_(self.scroll.bounds())
         col = NSTableColumn.alloc().initWithIdentifier_("main")
@@ -548,18 +531,21 @@ class PaletteWindow(NSObject):
         self.scroll.setDocumentView_(self.table)
         content.addSubview_(self.scroll)
 
-        self.preview = NSImageView.alloc().initWithFrame_(NSMakeRect(width - 200, 140, 180, 180))
+        self.preview = NSImageView.alloc().initWithFrame_(NSMakeRect(width - 200, 150, 180, 160))
         content.addSubview_(self.preview)
         self.info = NSTextField.alloc().initWithFrame_(NSMakeRect(width - 200, 12, 180, 120))
         self.info.setBezeled_(False); self.info.setDrawsBackground_(False)
         self.info.setEditable_(False); self.info.setSelectable_(False)
         content.addSubview_(self.info)
 
+        # Ensure search gets focus immediately and stays there
+        self.panel.setInitialFirstResponder_(self.search)
+        self.panel.makeFirstResponder_(self.search)
+
     def modeChanged_(self, _): self.performSearch()
     def searchFieldChanged_(self, _): self.performSearch()
     def controlTextDidChange_(self, _): self.performSearch()
 
-    # Arrow keys + Enter/Esc regardless of focus
     def _install_key_monitor_for_panel(self):
         def handler(event):
             try:
@@ -592,7 +578,7 @@ class PaletteWindow(NSObject):
         self._speak_selection(row)
         self._update_preview(row)
 
-    # Inline capture API — called on main thread
+    # Inline capture API
     def _apply_tts_policy_for_context(self, context: str):
         mode = PREFS.tts_mode
         if mode == "none":
@@ -997,7 +983,7 @@ class GlobalInput:
             except Exception:
                 ok = False
             if not ok and self._inline_enabled:
-                print("[WARN] CGEventTap unavailable. Enable Accessibility & Input Monitoring for your venv Python and Terminal/VSCode.")
+                print("[WARN] CGEventTap unavailable. Enable Accessibility & Input Monitoring for your Python & Terminal/VSCode.")
                 try:
                     self._start_nsevent_monitor()
                 except Exception:
@@ -1026,7 +1012,7 @@ class PreferencesPanel(NSObject):
         return self
 
     def _build_panel(self):
-        w, h = 520, 300
+        w, h = 560, 360
         frame = NSScreen.mainScreen().frame()
         x = frame.size.width / 2 - w / 2
         y = frame.size.height / 2 - h / 2
@@ -1038,80 +1024,106 @@ class PreferencesPanel(NSObject):
         self.panel.setTitle_("Emotifi Preferences")
         self.panel.setLevel_(NSFloatingWindowLevel)
         self.panel.setCollectionBehavior_(NSWindowCollectionBehaviorCanJoinAllSpaces)
-
         content = self.panel.contentView()
 
-        y_cursor = h - 60
-
-        def label(text, x=20, y=None, w=200, hh=22):
-            t = NSTextField.alloc().initWithFrame_(NSMakeRect(x, y if y is not None else y_cursor, w, hh))
+        y_cursor = h - 52
+        def header(text, y):
+            t = NSTextField.alloc().initWithFrame_(NSMakeRect(20, y, w-40, 24))
             t.setStringValue_(text)
             t.setBezeled_(False); t.setDrawsBackground_(False)
             t.setEditable_(False); t.setSelectable_(False)
             content.addSubview_(t)
             return t
+        def subtext(text, y):
+            t = NSTextField.alloc().initWithFrame_(NSMakeRect(20, y, w-40, 18))
+            t.setStringValue_(text)
+            t.setBezeled_(False); t.setDrawsBackground_(False)
+            t.setEditable_(False); t.setSelectable_(False)
+            content.addSubview_(t)
+            return t
+        def line(y):
+            box = NSBox.alloc().initWithFrame_(NSMakeRect(20, y, w-40, 1))
+            box.setBoxType_(2)  # separator
+            content.addSubview_(box)
+
+        header("General", y_cursor); y_cursor -= 8
+        subtext("Tweak capture behavior, launch on login, and speech feedback.", y_cursor-18)
+        y_cursor -= 36
+        line(y_cursor); y_cursor -= 12
 
         # checkbox helper using tag map (no custom attrs on Cocoa objects)
         self._pref_map: Dict[int, str] = {}
         self._next_tag = 1
-        def checkbox(title, x, y, key):
-            btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, 260, 24))
+        def checkbox(title, y, key):
+            btn = NSButton.alloc().initWithFrame_(NSMakeRect(20, y, 280, 24))
             btn.setButtonType_(3)  # checkbox
             btn.setTitle_(title)
             btn.setState_(1 if PREFS.get(key) else 0)
-            btn.setTarget_(self)
-            btn.setAction_("togglePref:")
+            btn.setTarget_(self); btn.setAction_("togglePref:")
             btn.setTag_(self._next_tag)
             self._pref_map[self._next_tag] = key
             self._next_tag += 1
             content.addSubview_(btn)
             return btn
 
-        # Launch at login
-        self.chk_login  = checkbox("Launch at login",               20, y_cursor, "launch_at_login"); y_cursor -= 36
-        # Inline capture
-        self.chk_inline = checkbox("Enable inline capture (“::”)",  20, y_cursor, "enable_inline");   y_cursor -= 36
-        # Hotkey enable + display
-        self.chk_hotkey = checkbox("Enable global shortcut",        20, y_cursor, "enable_hotkey");   y_cursor -= 36
+        self.chk_login  = checkbox("Launch at login",               y_cursor, "launch_at_login"); y_cursor -= 30
+        self.chk_inline = checkbox("Enable inline capture (“::”)",  y_cursor, "enable_inline");   y_cursor -= 30
+        self.chk_hotkey = checkbox("Enable global shortcut",        y_cursor, "enable_hotkey");   y_cursor -= 40
 
-        label("Shortcut:", 40, y_cursor)
-        self.shortcut_field = NSTextField.alloc().initWithFrame_(NSMakeRect(110, y_cursor-2, 180, 24))
+        # Shortcut row
+        st_label = NSTextField.alloc().initWithFrame_(NSMakeRect(40, y_cursor, 80, 24))
+        st_label.setStringValue_("Shortcut:")
+        st_label.setBezeled_(False); st_label.setDrawsBackground_(False)
+        st_label.setEditable_(False); st_label.setSelectable_(False)
+        content.addSubview_(st_label)
+
+        self.shortcut_field = NSTextField.alloc().initWithFrame_(NSMakeRect(120, y_cursor+1, 180, 24))
         self.shortcut_field.setStringValue_(PREFS.hotkey)
         self.shortcut_field.setEditable_(False); self.shortcut_field.setBezeled_(True)
         content.addSubview_(self.shortcut_field)
 
-        self.btn_record = NSButton.alloc().initWithFrame_(NSMakeRect(300, y_cursor-4, 100, 28))
+        self.btn_record = NSButton.alloc().initWithFrame_(NSMakeRect(310, y_cursor, 100, 26))
+        self.btn_record.setBezelStyle_(NSBezelStyleRounded)
         self.btn_record.setTitle_("Record")
         self.btn_record.setTarget_(self); self.btn_record.setAction_("recordShortcut:")
         content.addSubview_(self.btn_record)
 
-        self.btn_clear = NSButton.alloc().initWithFrame_(NSMakeRect(410, y_cursor-4, 80, 28))
+        self.btn_clear = NSButton.alloc().initWithFrame_(NSMakeRect(418, y_cursor, 100, 26))
+        self.btn_clear.setBezelStyle_(NSBezelStyleRounded)
         self.btn_clear.setTitle_("Clear")
         self.btn_clear.setTarget_(self); self.btn_clear.setAction_("clearShortcut:")
         content.addSubview_(self.btn_clear)
-        y_cursor -= 40
+        y_cursor -= 42
 
-        # Speech mode
-        label("Speech mode:", 20, y_cursor)
-        self.popup_tts = NSPopUpButton.alloc().initWithFrame_(NSMakeRect(120, y_cursor-4, 180, 26))
+        # Speech
+        header("Speech", y_cursor); y_cursor -= 8
+        subtext("Choose when Emotifi speaks your current selection.", y_cursor-18)
+        y_cursor -= 36
+        line(y_cursor); y_cursor -= 12
+
+        tts_label = NSTextField.alloc().initWithFrame_(NSMakeRect(20, y_cursor, 90, 24))
+        tts_label.setStringValue_("Speech mode:")
+        tts_label.setBezeled_(False); tts_label.setDrawsBackground_(False)
+        tts_label.setEditable_(False); tts_label.setSelectable_(False)
+        content.addSubview_(tts_label)
+
+        self.popup_tts = NSPopUpButton.alloc().initWithFrame_(NSMakeRect(120, y_cursor-2, 200, 26))
         self.popup_tts.addItemsWithTitles_(["Inline only", "All capture", "None"])
         current = PREFS.tts_mode
         idx = {"inline":0, "all":1, "none":2}.get(current, 0)
         self.popup_tts.selectItemAtIndex_(idx)
         self.popup_tts.setTarget_(self); self.popup_tts.setAction_("changedTTS:")
         content.addSubview_(self.popup_tts)
-
-        # Footer hint
         y_cursor -= 50
-        label("Changes are saved immediately.", 20, y_cursor, 380, 20)
+
+        subtext("Tip: To trigger inline capture, type “::” in any text field. Global shortcut opens the palette anywhere.", y_cursor)
 
     # Actions
     def togglePref_(self, sender):
         try:
             tag = int(sender.tag())
             key = self._pref_map.get(tag)
-            if not key:
-                return
+            if not key: return
             val = bool(sender.state())
             PREFS.set(key, val)
             if key == "launch_at_login":
@@ -1129,8 +1141,7 @@ class PreferencesPanel(NSObject):
         PREFS.set("tts_mode", mode)
 
     def recordShortcut_(self, _):
-        if getattr(self, "_recording", False):
-            return
+        if getattr(self, "_recording", False): return
         self._recording = True
         self.btn_record.setTitle_("Recording…")
         self.shortcut_field.setStringValue_("Press keys…")
@@ -1139,10 +1150,8 @@ class PreferencesPanel(NSObject):
             try:
                 flags = int(ns_event.modifierFlags())
                 key = (ns_event.charactersIgnoringModifiers() or "").lower()
-                if not key:
-                    return None
-                if len(key) > 1 and key != " ":
-                    key = key[0]
+                if not key: return None
+                if len(key) > 1 and key != " ": key = key[0]
                 mods = 0
                 if flags & NSEventModifierFlagCommand: mods |= NSEventModifierFlagCommand
                 if flags & NSEventModifierFlagShift: mods |= NSEventModifierFlagShift
@@ -1157,10 +1166,8 @@ class PreferencesPanel(NSObject):
                 pass
             finally:
                 try:
-                    if self._record_monitor:
-                        NSEvent.removeMonitor_(self._record_monitor)
-                except Exception:
-                    pass
+                    if self._record_monitor: NSEvent.removeMonitor_(self._record_monitor)
+                except Exception: pass
                 self._record_monitor = None
                 self._recording = False
                 self.btn_record.setTitle_("Record")
@@ -1183,17 +1190,19 @@ class PreferencesPanel(NSObject):
 class MenuApp(rumps.App):
     def __init__(self):
         super().__init__("🎛️", title="")
+        # Remove Rumps' default Quit (prevents duplicate Quit).
+        self.quit_button = None
+
         self.palette = PaletteWindow.alloc().init()
         self.prefs_ui = PreferencesPanel.alloc().initWithOwner_(self)
         self.menu = [
             rumps.MenuItem("Open Palette (⌘⇧E or '::')", callback=self.open_palette_hotkey),
             rumps.MenuItem("Preferences…", callback=self.open_prefs),
             None,
-            rumps.MenuItem("Open Accessibility Settings", callback=lambda _: self._open_access()),
-            rumps.MenuItem("Open Input Monitoring", callback=lambda _: self._open_inputmon()),
-            None,
+            # Keep only ONE Quit — use our explicit menu item:
             rumps.MenuItem("Quit", callback=self.quit_app),
         ]
+
         self.input = GlobalInput(self.open_palette_hotkey, self.palette)
         self.input.start()
 
@@ -1202,18 +1211,6 @@ class MenuApp(rumps.App):
 
         global ACTIVE_INPUT
         ACTIVE_INPUT = self.input
-
-    def _open_access(self):
-        try:
-            NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"))
-        except Exception:
-            pass
-
-    def _open_inputmon(self):
-        try:
-            NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"))
-        except Exception:
-            pass
 
     def open_prefs(self, *_):
         self.prefs_ui.show()
