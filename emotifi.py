@@ -5,22 +5,17 @@ Emotifi — menubar Emoji/GIF/Sticker picker for macOS (single-file, Python)
 
 This build:
   • Emoji/GIF/Sticker palette with fuzzy emoji search + synonyms.
+  • My Stickers — import images, auto-convert to ≤512px PNG, searchable & paste-ready.
   • Inline '::' capture via CGEvent tap (preferred) or NSEvent fallback.
   • Backspace cleanup around inline insertion (no stray colons).
   • Global hotkey (⌘⇧E by default), thread-safe dispatch to main.
   • TTS on selection (configurable).
-  • Preferences (persisted):
-      - Launch at login
-      - Enable inline capture
-      - Enable global shortcut + Record Shortcut
-      - Speech mode: Inline only / All capture / None
-  • UI polish:
-      - Removed “Accessibility/Input Monitoring” buttons & extra menu clutter
-      - Single Quit item (no duplicates)
-      - Cleaner Preferences layout with section headers & helper text
+  • Preferences (persisted): launch at login, inline capture, hotkey recording, speech mode.
+  • UI polish with friendly banner, emoji section labels, clearer empty states.
+  • First open after startup always defaults to the Emoji tab.
 """
 
-import os, sys, json, threading, time, difflib, re, subprocess
+import os, sys, json, threading, time, difflib, re, subprocess, uuid
 import requests
 import rumps
 from collections import deque
@@ -69,6 +64,8 @@ from AppKit import (
     NSPopUpButton,
     NSBox,
     NSBezelStyleRounded,
+    NSOpenPanel,
+    NSBitmapImageFileTypePNG,   # correct PNG enum in PyObjC
 )
 from Foundation import NSObject, NSURL, NSData, NSIndexSet, NSOperationQueue, NSTimer
 from objc import super as objc_super
@@ -114,7 +111,7 @@ TRIGGER_TOKEN = "::"  # inline trigger
 
 # ---- Shared HTTP session + caches ----
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "Emotifi/2.5"})
+HTTP.headers.update({"User-Agent": "Emotifi/2.8"})
 IMG_CACHE: Dict[str, bytes] = {}     # url -> bytes
 
 # ========= Preferences (persisted) =========
@@ -123,13 +120,14 @@ APP_SUPPORT_DIR = os.path.join(os.path.expanduser("~/Library/Application Support
 PREFS_PATH = os.path.join(APP_SUPPORT_DIR, "prefs.json")
 LAUNCH_AGENTS_DIR = os.path.expanduser("~/Library/LaunchAgents")
 LAUNCH_PLIST = os.path.join(LAUNCH_AGENTS_DIR, f"{APP_ID}.plist")
+STICKERS_DIR = os.path.join(APP_SUPPORT_DIR, "Stickers")
 
 DEFAULT_PREFS = {
     "launch_at_login": False,
     "enable_inline": True,
     "enable_hotkey": True,
-    "hotkey": "CMD+SHIFT+E",  # human-readable; persisted
-    "tts_mode": "inline",     # one of: "inline", "all", "none"
+    "hotkey": "CMD+SHIFT+E",
+    "tts_mode": "inline",     # "inline" | "all" | "none"
 }
 
 def _ensure_dir(p):
@@ -153,6 +151,7 @@ def _write_json(p, obj):
 class Prefs:
     def __init__(self):
         _ensure_dir(APP_SUPPORT_DIR)
+        _ensure_dir(STICKERS_DIR)
         self._data = _read_json(PREFS_PATH, DEFAULT_PREFS.copy())
 
     def get(self, k):
@@ -171,7 +170,7 @@ class Prefs:
     @property
     def hotkey(self): return str(self.get("hotkey") or "CMD+SHIFT+E")
     @property
-    def tts_mode(self): 
+    def tts_mode(self):
         v = str(self.get("tts_mode") or "inline")
         return v if v in ("inline","all","none") else "inline"
 
@@ -247,12 +246,12 @@ ACTIVE_INPUT = None
 # ---------- Models ----------
 @dataclass
 class ResultItem:
-    kind: str        # "emoji" | "gif" | "sticker"
+    kind: str        # "emoji" | "gif" | "sticker" | "mystick"
     display: str
     detail: str
     insert_text: str
     thumb_url: Optional[str] = None
-    media_url: Optional[str] = None
+    media_url: Optional[str] = None  # may be http(s) URL, file:// URL, or absolute path
 
 # ---------- Emoji search (improved fuzzy matching + synonyms) ----------
 class EmojiSearch:
@@ -294,6 +293,7 @@ class EmojiSearch:
             tokens = self._tokenize(terms)
             if terms:
                 self.rows.append((ch, name or ch, terms, tokens))
+        # Dedup
         seen = set(); uniq = []
         for ch, name, terms, tokens in self.rows:
             if ch in seen: continue
@@ -322,7 +322,7 @@ class EmojiSearch:
             q = "heart"
         qwords = self._expand_query(q)
         qjoined = " ".join(qwords)
-        hits: List[Tuple[float, str, str]] = []  # (score, name, ch)
+        hits: List[Tuple[float, str, str]] = []
         for ch, name, terms, tokens in self.rows:
             score = 0.0
             if q in terms: score += 6.0
@@ -386,7 +386,52 @@ class GiphySearch:
             print(f"[Giphy {self.kind}] empty results for q='{q}'. status={self.last_status}")
         return out
 
-# ---------- Paste helpers ----------
+# ---------- My Stickers search ----------
+class MyStickerSearch:
+    def __init__(self, folder: str):
+        self.folder = folder
+        _ensure_dir(self.folder)
+
+    def _all_files(self) -> List[str]:
+        try:
+            names = [n for n in os.listdir(self.folder) if not n.startswith(".")]
+            names.sort(key=lambda n: (0 if n.lower().endswith(".png") else 1, n.lower()))
+            return [os.path.join(self.folder, n) for n in names]
+        except Exception:
+            return []
+
+    def search(self, q: str, limit: int = 120) -> List[ResultItem]:
+        q = (q or "").strip().lower()
+        files = self._all_files()
+        out: List[ResultItem] = []
+        for path in files:
+            name = os.path.basename(path)
+            if q and q not in name.lower():
+                continue
+            file_url = "file://" + os.path.abspath(path)
+            display = os.path.splitext(name)[0]
+            out.append(ResultItem("mystick", display, "My Sticker", insert_text=file_url, thumb_url=file_url, media_url=file_url))
+            if len(out) >= limit: break
+        return out
+
+# ---------- Image & paste helpers ----------
+def _nsimage_from_any(uri_or_path: str) -> Optional[NSImage]:
+    try:
+        if uri_or_path.startswith("file://"):
+            path = uri_or_path[7:]
+            return NSImage.alloc().initWithContentsOfFile_(path)
+        if uri_or_path.startswith("http://") or uri_or_path.startswith("https://"):
+            data = IMG_CACHE.get(uri_or_path)
+            if data is None:
+                r = HTTP.get(uri_or_path, timeout=8); r.raise_for_status(); data = r.content; IMG_CACHE[uri_or_path] = data
+            nsdata = NSData.dataWithBytes_length_(data, len(data))
+            return NSImage.alloc().initWithData_(nsdata)
+        if os.path.exists(uri_or_path):
+            return NSImage.alloc().initWithContentsOfFile_(uri_or_path)
+    except Exception:
+        return None
+    return None
+
 def _activate_app_and_sleep(prev_app):
     try:
         if prev_app:
@@ -409,25 +454,21 @@ def insert_text_via_keystroke_paste(text: str, prev_app=None):
     Quartz.CGEventSetFlags(v_up, kCGEventFlagMaskCommand)
     CGEventPost(0, cmd_down); CGEventPost(0, v_down); CGEventPost(0, v_up); CGEventPost(0, cmd_up)
 
-def paste_image_from_url_or_fallback(url: Optional[str], prev_app=None) -> bool:
-    if not url: return False
+def paste_image_from_url_or_fallback(url_or_path: Optional[str], prev_app=None) -> bool:
+    if not url_or_path: return False
     try:
-        data = IMG_CACHE.get(url)
-        if data is None:
-            r = HTTP.get(url, timeout=8); r.raise_for_status(); data = r.content; IMG_CACHE[url] = data
-        _activate_app_and_sleep(prev_app)
-        nsdata = NSData.dataWithBytes_length_(data, len(data))
-        img = NSImage.alloc().initWithData_(nsdata)
+        img = _nsimage_from_any(url_or_path)
         if not img:
-            insert_text_via_keystroke_paste(url, prev_app=prev_app); return True
+            insert_text_via_keystroke_paste(url_or_path, prev_app=prev_app); return True
         tiff = img.TIFFRepresentation()
         png = None
         try:
             from AppKit import NSBitmapImageRep
             rep = NSBitmapImageRep.imageRepWithData_(tiff)
-            png = rep.representationUsingType_properties_(NSBitmapImageRep.NSPNGFileType, None)
+            png = rep.representationUsingType_properties_(NSBitmapImageFileTypePNG, None)
         except Exception:
             pass
+        _activate_app_and_sleep(prev_app)
         pb = NSPasteboard.generalPasteboard()
         pb.clearContents()
         wrote = False
@@ -442,10 +483,10 @@ def paste_image_from_url_or_fallback(url: Optional[str], prev_app=None) -> bool:
         Quartz.CGEventSetFlags(v_up, kCGEventFlagMaskCommand)
         CGEventPost(0, cmd_down); CGEventPost(0, v_down); CGEventPost(0, v_up); CGEventPost(0, cmd_up)
         if not wrote:
-            insert_text_via_keystroke_paste(url, prev_app=prev_app)
+            insert_text_via_keystroke_paste(url_or_path, prev_app=prev_app)
         return True
     except Exception:
-        insert_text_via_keystroke_paste(url, prev_app=prev_app)
+        insert_text_via_keystroke_paste(url_or_path, prev_app=prev_app)
         return True
 
 def backspace(n=1):
@@ -454,6 +495,112 @@ def backspace(n=1):
         bs_down = CGEventCreateKeyboardEvent(src, 0x33, True)
         bs_up = CGEventCreateKeyboardEvent(src, 0x33, False)
         CGEventPost(0, bs_down); CGEventPost(0, bs_up)
+
+# --- robust PNG resizing/saving ---
+def _best_bitmap_rep(nsimg: NSImage):
+    """Return an NSBitmapImageRep for the image (or None)."""
+    try:
+        tiff = nsimg.TIFFRepresentation()
+        if not tiff:
+            return None
+        from AppKit import NSBitmapImageRep
+        rep = NSBitmapImageRep.imageRepWithData_(tiff)
+        return rep
+    except Exception:
+        return None
+
+def _resize_png_bytes(nsimg: NSImage, max_dim: int = 512) -> Optional[bytes]:
+    """Returns PNG bytes of nsimg scaled to fit within max_dim while preserving aspect."""
+    try:
+        rep = _best_bitmap_rep(nsimg)
+        if not rep:
+            return None
+        w = float(rep.pixelsWide())
+        h = float(rep.pixelsHigh())
+        if w <= 0 or h <= 0:
+            return None
+        scale = min(max_dim / w, max_dim / h, 1.0)  # shrink only
+        new_w = int(round(w * scale))
+        new_h = int(round(h * scale))
+
+        from AppKit import NSBitmapImageRep, NSCalibratedRGBColorSpace
+        new_rep = NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(
+            None, new_w, new_h, 8, 4, True, False, NSCalibratedRGBColorSpace, 0, 0
+        )
+        if not new_rep:
+            return None
+
+        from AppKit import NSGraphicsContext
+        NSGraphicsContext.saveGraphicsState()
+        ctx = NSGraphicsContext.graphicsContextWithBitmapImageRep_(new_rep)
+        NSGraphicsContext.setCurrentContext_(ctx)
+        src_img = NSImage.alloc().initWithSize_((w, h))
+        src_img.addRepresentation_(rep)
+        src_img.drawInRect_(((0, 0), (new_w, new_h)))
+        NSGraphicsContext.restoreGraphicsState()
+
+        png = new_rep.representationUsingType_properties_(NSBitmapImageFileTypePNG, None)
+        if not png:
+            return None
+        return bytes(png)
+    except Exception:
+        return None
+
+def import_image_as_sticker() -> Optional[str]:
+    """
+    Opens a file dialog, imports an image, converts to PNG ≤512px, stores it in STICKERS_DIR.
+    Returns absolute file path or None.
+    """
+    try:
+        panel = NSOpenPanel.openPanel()
+        panel.setCanChooseFiles_(True)
+        panel.setCanChooseDirectories_(False)
+        panel.setAllowsMultipleSelection_(False)
+        panel.setAllowedFileTypes_(["png","jpg","jpeg","gif","tiff","heic","webp"])
+        if panel.runModal() != 1:
+            print("[Stickers] Import canceled.")
+            return None
+        url = panel.URL()
+        if not url:
+            print("[Stickers] No URL from panel.")
+            return None
+        path = url.path()
+        print(f"[Stickers] Selected: {path}")
+
+        img = _nsimage_from_any(path)
+        if not img:
+            print("[Stickers] Could not load image via NSImage.")
+            return None
+
+        _ensure_dir(STICKERS_DIR)
+
+        base = os.path.splitext(os.path.basename(path))[0]
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("_") or "sticker"
+        name = f"{safe}_{uuid.uuid4().hex[:6]}.png"
+        dest = os.path.join(STICKERS_DIR, name)
+
+        png_bytes = _resize_png_bytes(img, 512)
+        if png_bytes:
+            with open(dest, "wb") as f:
+                f.write(png_bytes)
+            print(f"[Stickers] Wrote PNG: {dest}")
+            return dest
+
+        rep = _best_bitmap_rep(img)
+        if rep:
+            from AppKit import NSBitmapImageRep
+            png2 = rep.representationUsingType_properties_(NSBitmapImageFileTypePNG, None)
+            if png2:
+                with open(dest, "wb") as f:
+                    f.write(bytes(png2))
+                print(f"[Stickers] Wrote PNG (no-resize fallback): {dest}")
+                return dest
+
+        print("[Stickers] Failed to produce PNG.")
+        return None
+    except Exception as e:
+        print(f"[Stickers] Import failed: {e}")
+        return None
 
 # ---------- Palette window ----------
 class PaletteWindow(NSObject):
@@ -470,13 +617,25 @@ class PaletteWindow(NSObject):
         self.emoji_engine = EmojiSearch()
         self.gif_engine = GiphySearch("gif")
         self.sticker_engine = GiphySearch("sticker")
+        self.mystick_engine = MyStickerSearch(STICKERS_DIR)
         self._build_ui()
         self._install_key_monitor_for_panel()
         return self
 
+    def _set_search_placeholder(self):
+        mode = self._current_mode()
+        ph = {
+            "emoji": "Search emoji… (try: tasty, love, chai)",
+            "gif": "Search GIFs… (e.g., happy, facepalm)",
+            "sticker": "Search stickers…",
+            "mystick": "Search My Stickers by name…",
+        }[mode]
+        try: self.search.setPlaceholderString_(ph)
+        except Exception: pass
+
     def _build_ui(self):
         frame = NSScreen.mainScreen().frame()
-        width, height = 560, 420
+        width, height = 680, 460
         x = frame.size.width / 2 - width / 2
         y = frame.size.height / 2 - height / 2
         self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
@@ -484,33 +643,33 @@ class PaletteWindow(NSObject):
             NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable,
             2, True,
         )
-        self.panel.setTitle_("Emotifi — Emoji • GIF • Sticker")
+        self.panel.setTitle_("Emotifi — 😀 Emoji • 🎞️ GIF • 🗒️ Sticker • ⭐ My")
         self.panel.setLevel_(NSFloatingWindowLevel)
         self.panel.setCollectionBehavior_(NSWindowCollectionBehaviorCanJoinAllSpaces)
 
         content = self.panel.contentView()
 
-        # Header help text
-        header = NSTextField.alloc().initWithFrame_(NSMakeRect(12, height - 48, width - 24, 20))
-        header.setStringValue_("Tip: Type to search • ↑/↓ to navigate • ⏎ to insert • ⌥⏎ to insert link • Esc to close")
-        header.setBezeled_(False); header.setDrawsBackground_(False)
-        header.setEditable_(False); header.setSelectable_(False)
-        content.addSubview_(header)
+        banner = NSTextField.alloc().initWithFrame_(NSMakeRect(12, height - 50, width - 24, 24))
+        banner.setStringValue_("✨ Tip: Type to search • ↑/↓ to navigate • ⏎ insert • ⌥⏎ insert link • Esc close • “::” for inline")
+        banner.setBezeled_(False); banner.setDrawsBackground_(False)
+        banner.setEditable_(False); banner.setSelectable_(False)
+        content.addSubview_(banner)
 
-        self.mode_seg = NSSegmentedControl.alloc().initWithFrame_(NSMakeRect(12, height - 74, 260, 24))
-        self.mode_seg.setSegmentCount_(3)
-        self.mode_seg.setLabel_forSegment_("Emoji", 0)
-        self.mode_seg.setLabel_forSegment_("GIFs", 1)
-        self.mode_seg.setLabel_forSegment_("Stickers", 2)
+        self.mode_seg = NSSegmentedControl.alloc().initWithFrame_(NSMakeRect(12, height - 78, 420, 26))
+        self.mode_seg.setSegmentCount_(4)
+        self.mode_seg.setLabel_forSegment_("😀 Emoji", 0)
+        self.mode_seg.setLabel_forSegment_("🎞️ GIFs", 1)
+        self.mode_seg.setLabel_forSegment_("🗒️ Stickers", 2)
+        self.mode_seg.setLabel_forSegment_("⭐ My", 3)
         try: self.mode_seg.setTrackingMode_(0)
         except Exception: pass
-        try: self.mode_seg.setSelectedSegment_(0)
+        try: self.mode_seg.setSelectedSegment_(0)          # default to Emoji tab in UI
         except Exception: self.mode_seg.setSelected_forSegment_(True, 0)
         self.mode_seg.setTarget_(self); self.mode_seg.setAction_("modeChanged:")
         content.addSubview_(self.mode_seg)
 
-        self.search = NSSearchField.alloc().initWithFrame_(NSMakeRect(280, height - 78, width - 292, 28))
-        self.search.setPlaceholderString_("Search…")
+        self.search = NSSearchField.alloc().initWithFrame_(NSMakeRect(450, height - 82, width - 462, 30))
+        self._set_search_placeholder()
         try: self.search.setContinuous_(True)
         except Exception: pass
         self.search.setTarget_(self); self.search.setAction_("searchFieldChanged:")
@@ -520,7 +679,7 @@ class PaletteWindow(NSObject):
         )
         content.addSubview_(self.search)
 
-        self.scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(12, 40, width - 220, height - 130))
+        self.scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(12, 48, width - 230, height - 140))
         self.scroll.setHasVerticalScroller_(True)
         self.table = NSTableView.alloc().initWithFrame_(self.scroll.bounds())
         col = NSTableColumn.alloc().initWithIdentifier_("main")
@@ -531,18 +690,30 @@ class PaletteWindow(NSObject):
         self.scroll.setDocumentView_(self.table)
         content.addSubview_(self.scroll)
 
-        self.preview = NSImageView.alloc().initWithFrame_(NSMakeRect(width - 200, 150, 180, 160))
+        self.preview = NSImageView.alloc().initWithFrame_(NSMakeRect(width - 206, 164, 190, 170))
         content.addSubview_(self.preview)
-        self.info = NSTextField.alloc().initWithFrame_(NSMakeRect(width - 200, 12, 180, 120))
+        self.info = NSTextField.alloc().initWithFrame_(NSMakeRect(width - 206, 48, 190, 100))
         self.info.setBezeled_(False); self.info.setDrawsBackground_(False)
         self.info.setEditable_(False); self.info.setSelectable_(False)
         content.addSubview_(self.info)
 
-        # Ensure search gets focus immediately and stays there
         self.panel.setInitialFirstResponder_(self.search)
         self.panel.makeFirstResponder_(self.search)
 
-    def modeChanged_(self, _): self.performSearch()
+    def select_tab(self, name: str):
+        """Force a tab selection by name and refresh placeholder."""
+        idx_map = {"emoji": 0, "gif": 1, "sticker": 2, "mystick": 3}
+        idx = idx_map.get(name, 0)
+        try:
+            self.mode_seg.setSelectedSegment_(idx)
+        except Exception:
+            self.mode_seg.setSelected_forSegment_(True, idx)
+        self._set_search_placeholder()
+
+    def modeChanged_(self, _):
+        self._set_search_placeholder()
+        self.performSearch()
+
     def searchFieldChanged_(self, _): self.performSearch()
     def controlTextDidChange_(self, _): self.performSearch()
 
@@ -578,7 +749,6 @@ class PaletteWindow(NSObject):
         self._speak_selection(row)
         self._update_preview(row)
 
-    # Inline capture API
     def _apply_tts_policy_for_context(self, context: str):
         mode = PREFS.tts_mode
         if mode == "none":
@@ -622,28 +792,49 @@ class PaletteWindow(NSObject):
     def _current_mode(self) -> str:
         try:
             idx = int(self.mode_seg.selectedSegment())
-            return ["emoji", "gif", "sticker"][max(0, min(2, idx))]
+            return ["emoji", "gif", "sticker", "mystick"][max(0, min(3, idx))]
         except Exception:
             return "emoji"
+
+    def _empty_hint(self, mode: str, q: str) -> str:
+        if mode == "emoji":
+            return "No emoji found."
+        if mode == "gif":
+            return "No GIFs—try another word (e.g., happy, excited)."
+        if mode == "sticker":
+            return "No stickers—try a different word."
+        if mode == "mystick":
+            return "No stickers yet. Use Menu → Add Sticker…"
+        return "No results."
 
     def performSearch(self):
         q = self.search.stringValue()
         mode = self._current_mode()
         if mode == "emoji":
             items = self.emoji_engine.search(q)
-            self._apply_results_on_main(items, hint=("No emoji found." if not items else ""))
+            self._apply_results_on_main(items, hint=self._empty_hint(mode, q))
             return
-        if self._debounce_timer: self._debounce_timer.cancel()
+
+        if mode == "mystick":
+            items = self.mystick_engine.search(q)
+            self._apply_results_on_main(items, hint=self._empty_hint(mode, q))
+            return
+
+        # GIF / Sticker (GIPHY) — debounced
+        if self._debounce_timer:
+            self._debounce_timer.cancel()
         self._search_generation += 1
         gen = self._search_generation
+
         def fire():
             engine = self.gif_engine if mode == "gif" else self.sticker_engine
             items = engine.search(q)
             hint = self._giphy_hint(engine, q) if not items else ""
             def apply():
                 if gen == self._search_generation:
-                    self._apply_results(items, hint)
+                    self._apply_results(items, hint or self._empty_hint(mode, q))
             NSOperationQueue.mainQueue().addOperationWithBlock_(apply)
+
         self._debounce_timer = threading.Timer(0.22, fire)
         self._debounce_timer.daemon = True
         self._debounce_timer.start()
@@ -670,6 +861,7 @@ class PaletteWindow(NSObject):
             self.preview.setImage_(None)
             self.info.setStringValue_(hint or "No results.")
 
+    # Table datasource/delegate
     def numberOfRowsInTableView_(self, _): return len(self.current_items)
     def tableView_objectValueForTableColumn_row_(self, _, __, row):
         try:
@@ -695,30 +887,17 @@ class PaletteWindow(NSObject):
     def _update_preview(self, row: int):
         try:
             it = self.current_items[row]
-            self.info.setStringValue_(f"{it.kind.upper()}\n{it.display}\n\nEnter: insert   ⌥Enter: link   Esc: close")
+            self.info.setStringValue_(f"{it.kind.UPPER() if hasattr(it.kind,'UPPER') else it.kind.upper()}\n{it.display}\n\nEnter: insert   ⌥Enter: link   Esc: close")
             if it.kind == "emoji":
                 self.preview.setImage_(None); return
-            url = it.thumb_url or it.media_url
-            if not url: self.preview.setImage_(None); return
-            data = IMG_CACHE.get(url)
-            if data is None:
-                def load():
-                    try:
-                        r = HTTP.get(url, timeout=6); r.raise_for_status(); data2 = r.content; IMG_CACHE[url] = data2
-                    except Exception: data2 = None
-                    def apply():
-                        if data2:
-                            nsdata = NSData.dataWithBytes_length_(data2, len(data2))
-                            img = NSImage.alloc().initWithData_(nsdata)
-                            self.preview.setImage_(img)
-                        else:
-                            self.preview.setImage_(None)
-                    NSOperationQueue.mainQueue().addOperationWithBlock_(apply)
-                threading.Thread(target=load, daemon=True).start()
-            else:
-                nsdata = NSData.dataWithBytes_length_(data, len(data))
-                img = NSImage.alloc().initWithData_(nsdata)
+            url = it.thumb_url or it.media_url or it.insert_text
+            if not url:
+                self.preview.setImage_(None); return
+            img = _nsimage_from_any(url)
+            if img:
                 self.preview.setImage_(img)
+            else:
+                self.preview.setImage_(None)
         except Exception: pass
 
     def hide(self):
@@ -730,21 +909,21 @@ class PaletteWindow(NSObject):
             it = self.current_items[row]
             prev = self._prev_app
             self.hide()
+            # Clean & one extra backspace if inline
             try:
                 if ACTIVE_INPUT:
                     ACTIVE_INPUT.inline_cleanup_on_insert()
-            except Exception:
-                pass
+            except Exception: pass
             try:
                 if ACTIVE_INPUT and getattr(ACTIVE_INPUT, "last_triggered_inline", False):
                     backspace(1)
-            except Exception:
-                pass
+            except Exception: pass
+
             def do_paste():
                 if it.kind == "emoji":
                     insert_text_via_keystroke_paste(it.insert_text, prev_app=prev)
-                else:
-                    if link_mode:
+                elif it.kind in ("gif", "sticker", "mystick"):
+                    if link_mode and it.kind != "mystick":
                         insert_text_via_keystroke_paste(it.media_url or it.insert_text, prev_app=prev)
                     else:
                         ok = paste_image_from_url_or_fallback(it.media_url or it.thumb_url or it.insert_text, prev_app=prev)
@@ -756,6 +935,33 @@ class PaletteWindow(NSObject):
                 except Exception:
                     pass
             threading.Thread(target=do_paste, daemon=True).start()
+
+    # === helper used by menu after import ===
+    def show_my_stickers(self, select_basename: Optional[str] = None):
+        """Switch to ⭐ My tab, clear search, refresh, and optionally select a filename."""
+        try:
+            try:
+                self.mode_seg.setSelectedSegment_(3)
+            except Exception:
+                self.mode_seg.setSelected_forSegment_(True, 3)
+            self._set_search_placeholder()
+            self.search.setStringValue_("")
+            self.performSearch()
+            if select_basename:
+                name_key = os.path.splitext(os.path.basename(select_basename))[0].lower()
+                def _select_row():
+                    try:
+                        for i, it in enumerate(self.current_items):
+                            if (it.kind == "mystick") and (name_key in it.display.lower()):
+                                self.table.selectRowIndexes_byExtendingSelection_(NSIndexSet.indexSetWithIndex_(i), False)
+                                self.table.scrollRowToVisible_(i)
+                                self._update_preview(i)
+                                break
+                    except Exception:
+                        pass
+                NSOperationQueue.mainQueue().addOperationWithBlock_(_select_row)
+        except Exception:
+            pass
 
 # ---------- Global input (hotkey + inline capture) ----------
 class GlobalInput:
@@ -852,7 +1058,7 @@ class GlobalInput:
         try:
             keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
             flags = CGEventGetFlags(event)
-            if int(keycode) == 41:  # semicolon
+            if int(keycode) == 41:  # semicolon key
                 return ":" if (flags & kCGEventFlagMaskShift) else ";"
         except Exception:
             pass
@@ -931,8 +1137,8 @@ class GlobalInput:
         tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, 0, CGEventMaskBit(kCGEventKeyDown), callback, None)
         if not tap:
             tap = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap, 0, CGEventMaskBit(kCGEventKeyDown), callback, None)
-            if not tap:
-                return False
+        if not tap:
+            return False
         src = CFMachPortCreateRunLoopSource(None, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetCurrent(), src, Quartz.kCFRunLoopCommonModes)
         CGEventTapEnable(tap, True)
@@ -1012,7 +1218,7 @@ class PreferencesPanel(NSObject):
         return self
 
     def _build_panel(self):
-        w, h = 560, 360
+        w, h = 580, 380
         frame = NSScreen.mainScreen().frame()
         x = frame.size.width / 2 - w / 2
         y = frame.size.height / 2 - h / 2
@@ -1026,103 +1232,85 @@ class PreferencesPanel(NSObject):
         self.panel.setCollectionBehavior_(NSWindowCollectionBehaviorCanJoinAllSpaces)
         content = self.panel.contentView()
 
-        y_cursor = h - 52
+        y_cursor = h - 56
         def header(text, y):
-            t = NSTextField.alloc().initWithFrame_(NSMakeRect(20, y, w-40, 24))
+            t = NSTextField.alloc().initWithFrame_(NSMakeRect(20, y, w-40, 26))
             t.setStringValue_(text)
             t.setBezeled_(False); t.setDrawsBackground_(False)
             t.setEditable_(False); t.setSelectable_(False)
-            content.addSubview_(t)
-            return t
+            content.addSubview_(t); return t
         def subtext(text, y):
             t = NSTextField.alloc().initWithFrame_(NSMakeRect(20, y, w-40, 18))
             t.setStringValue_(text)
             t.setBezeled_(False); t.setDrawsBackground_(False)
             t.setEditable_(False); t.setSelectable_(False)
-            content.addSubview_(t)
-            return t
+            content.addSubview_(t); return t
         def line(y):
             box = NSBox.alloc().initWithFrame_(NSMakeRect(20, y, w-40, 1))
-            box.setBoxType_(2)  # separator
-            content.addSubview_(box)
+            box.setBoxType_(2); content.addSubview_(box)
 
-        header("General", y_cursor); y_cursor -= 8
-        subtext("Tweak capture behavior, launch on login, and speech feedback.", y_cursor-18)
-        y_cursor -= 36
-        line(y_cursor); y_cursor -= 12
+        header("⚙️  General", y_cursor); y_cursor -= 8
+        subtext("Tweak capture behavior, launch at login, and speech feedback.", y_cursor-18)
+        y_cursor -= 36; line(y_cursor); y_cursor -= 12
 
-        # checkbox helper using tag map (no custom attrs on Cocoa objects)
         self._pref_map: Dict[int, str] = {}
         self._next_tag = 1
         def checkbox(title, y, key):
-            btn = NSButton.alloc().initWithFrame_(NSMakeRect(20, y, 280, 24))
-            btn.setButtonType_(3)  # checkbox
-            btn.setTitle_(title)
+            btn = NSButton.alloc().initWithFrame_(NSMakeRect(20, y, 300, 24))
+            btn.setButtonType_(3); btn.setTitle_(title)
             btn.setState_(1 if PREFS.get(key) else 0)
             btn.setTarget_(self); btn.setAction_("togglePref:")
-            btn.setTag_(self._next_tag)
-            self._pref_map[self._next_tag] = key
-            self._next_tag += 1
-            content.addSubview_(btn)
-            return btn
+            btn.setTag_(self._next_tag); self._pref_map[self._next_tag] = key; self._next_tag += 1
+            content.addSubview_(btn); return btn
 
         self.chk_login  = checkbox("Launch at login",               y_cursor, "launch_at_login"); y_cursor -= 30
         self.chk_inline = checkbox("Enable inline capture (“::”)",  y_cursor, "enable_inline");   y_cursor -= 30
         self.chk_hotkey = checkbox("Enable global shortcut",        y_cursor, "enable_hotkey");   y_cursor -= 40
 
-        # Shortcut row
-        st_label = NSTextField.alloc().initWithFrame_(NSMakeRect(40, y_cursor, 80, 24))
+        st_label = NSTextField.alloc().initWithFrame_(NSMakeRect(40, y_cursor, 90, 24))
         st_label.setStringValue_("Shortcut:")
-        st_label.setBezeled_(False); st_label.setDrawsBackground_(False)
-        st_label.setEditable_(False); st_label.setSelectable_(False)
+        st_label.setBezeled_(False); st_label.setDrawsBackground_(False); st_label.setEditable_(False); st_label.setSelectable_(False)
         content.addSubview_(st_label)
 
-        self.shortcut_field = NSTextField.alloc().initWithFrame_(NSMakeRect(120, y_cursor+1, 180, 24))
+        self.shortcut_field = NSTextField.alloc().initWithFrame_(NSMakeRect(126, y_cursor+1, 190, 24))
         self.shortcut_field.setStringValue_(PREFS.hotkey)
         self.shortcut_field.setEditable_(False); self.shortcut_field.setBezeled_(True)
         content.addSubview_(self.shortcut_field)
 
-        self.btn_record = NSButton.alloc().initWithFrame_(NSMakeRect(310, y_cursor, 100, 26))
-        self.btn_record.setBezelStyle_(NSBezelStyleRounded)
-        self.btn_record.setTitle_("Record")
+        self.btn_record = NSButton.alloc().initWithFrame_(NSMakeRect(320, y_cursor, 110, 26))
+        self.btn_record.setBezelStyle_(NSBezelStyleRounded); self.btn_record.setTitle_("Record")
         self.btn_record.setTarget_(self); self.btn_record.setAction_("recordShortcut:")
         content.addSubview_(self.btn_record)
 
-        self.btn_clear = NSButton.alloc().initWithFrame_(NSMakeRect(418, y_cursor, 100, 26))
-        self.btn_clear.setBezelStyle_(NSBezelStyleRounded)
-        self.btn_clear.setTitle_("Clear")
+        self.btn_clear = NSButton.alloc().initWithFrame_(NSMakeRect(434, y_cursor, 110, 26))
+        self.btn_clear.setBezelStyle_(NSBezelStyleRounded); self.btn_clear.setTitle_("Clear")
         self.btn_clear.setTarget_(self); self.btn_clear.setAction_("clearShortcut:")
         content.addSubview_(self.btn_clear)
-        y_cursor -= 42
+        y_cursor -= 46
 
-        # Speech
-        header("Speech", y_cursor); y_cursor -= 8
+        header("🗣️  Speech", y_cursor); y_cursor -= 8
         subtext("Choose when Emotifi speaks your current selection.", y_cursor-18)
-        y_cursor -= 36
-        line(y_cursor); y_cursor -= 12
+        y_cursor -= 36; line(y_cursor); y_cursor -= 12
 
-        tts_label = NSTextField.alloc().initWithFrame_(NSMakeRect(20, y_cursor, 90, 24))
+        tts_label = NSTextField.alloc().initWithFrame_(NSMakeRect(20, y_cursor, 110, 24))
         tts_label.setStringValue_("Speech mode:")
-        tts_label.setBezeled_(False); tts_label.setDrawsBackground_(False)
-        tts_label.setEditable_(False); tts_label.setSelectable_(False)
+        tts_label.setBezeled_(False); tts_label.setDrawsBackground_(False); tts_label.setEditable_(False); tts_label.setSelectable_(False)
         content.addSubview_(tts_label)
 
-        self.popup_tts = NSPopUpButton.alloc().initWithFrame_(NSMakeRect(120, y_cursor-2, 200, 26))
+        self.popup_tts = NSPopUpButton.alloc().initWithFrame_(NSMakeRect(130, y_cursor-2, 220, 26))
         self.popup_tts.addItemsWithTitles_(["Inline only", "All capture", "None"])
         current = PREFS.tts_mode
         idx = {"inline":0, "all":1, "none":2}.get(current, 0)
         self.popup_tts.selectItemAtIndex_(idx)
         self.popup_tts.setTarget_(self); self.popup_tts.setAction_("changedTTS:")
         content.addSubview_(self.popup_tts)
-        y_cursor -= 50
+        y_cursor -= 52
 
-        subtext("Tip: To trigger inline capture, type “::” in any text field. Global shortcut opens the palette anywhere.", y_cursor)
+        subtext("Tip: Menu → Add Sticker… to import your images. They appear under the ⭐ My tab.", y_cursor)
 
-    # Actions
     def togglePref_(self, sender):
         try:
-            tag = int(sender.tag())
-            key = self._pref_map.get(tag)
+            tag = int(sender.tag()); key = self._pref_map.get(tag)
             if not key: return
             val = bool(sender.state())
             PREFS.set(key, val)
@@ -1190,18 +1378,26 @@ class PreferencesPanel(NSObject):
 class MenuApp(rumps.App):
     def __init__(self):
         super().__init__("🎛️", title="")
-        # Remove Rumps' default Quit (prevents duplicate Quit).
-        self.quit_button = None
+        self.quit_button = None  # remove default Quit to avoid duplicate
 
         self.palette = PaletteWindow.alloc().init()
+        # Ensure the palette's default tab is Emoji at app startup
+        try:
+            self.palette.select_tab("emoji")
+        except Exception:
+            pass
+
         self.prefs_ui = PreferencesPanel.alloc().initWithOwner_(self)
         self.menu = [
             rumps.MenuItem("Open Palette (⌘⇧E or '::')", callback=self.open_palette_hotkey),
+            rumps.MenuItem("Add Sticker…", callback=self.add_sticker),
+            rumps.MenuItem("Open Stickers Folder", callback=self.open_sticker_folder),
             rumps.MenuItem("Preferences…", callback=self.open_prefs),
             None,
-            # Keep only ONE Quit — use our explicit menu item:
             rumps.MenuItem("Quit", callback=self.quit_app),
         ]
+
+        self._first_open_done = False
 
         self.input = GlobalInput(self.open_palette_hotkey, self.palette)
         self.input.start()
@@ -1219,6 +1415,14 @@ class MenuApp(rumps.App):
         NSOperationQueue.mainQueue().addOperationWithBlock_(self._open_palette_main)
 
     def _open_palette_main(self):
+        # FIRST OPEN after startup → force Emoji tab
+        if not self._first_open_done:
+            try:
+                self.palette.select_tab("emoji")
+            except Exception:
+                pass
+            self._first_open_done = True
+
         self.palette._apply_tts_policy_for_context("hotkey")
         self.palette._prev_app = NSWorkspace.sharedWorkspace().frontmostApplication()
         NSApp.activateIgnoringOtherApps_(True)
@@ -1237,6 +1441,26 @@ class MenuApp(rumps.App):
             except Exception:
                 pass
         NSOperationQueue.mainQueue().addOperationWithBlock_(_refocus_block)
+
+    def add_sticker(self, *_):
+        path = import_image_as_sticker()
+        if path:
+            print(f"[Stickers] Imported: {path}")
+            try:
+                self.palette.show_my_stickers(select_basename=os.path.basename(path))
+            except Exception:
+                try:
+                    if self.palette._current_mode() == "mystick":
+                        self.palette.search.setStringValue_("")
+                        self.palette.performSearch()
+                except Exception:
+                    pass
+
+    def open_sticker_folder(self, *_):
+        try:
+            NSWorkspace.sharedWorkspace().openURL_(NSURL.fileURLWithPath_(STICKERS_DIR))
+        except Exception:
+            pass
 
     def quit_app(self, *_):
         rumps.quit_application()
