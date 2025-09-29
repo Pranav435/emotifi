@@ -1,0 +1,47 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.egg-info/
+*.egg
+.Python
+
+# --- Virtual environments ---
+venv/
+buildenv/
+.env/
+.venv/
+
+# --- macOS cruft ---
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# --- py2app build output ---
+build/
+dist/
+*.app
+*.dmg
+
+# --- Logs / cache ---
+*.log
+*.sqlite
+*.db
+*.db-journal
+.cache/
+.mypy_cache/
+.pytest_cache/
+coverage.xml
+htmlcov/
+
+# --- Secrets ---
+secrets.json
+*.key
+*.pem
+
+# --- IDE files ---
+.vscode/
+.idea/
+*.swp

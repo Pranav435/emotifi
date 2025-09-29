@@ -3,16 +3,18 @@
 """
 Emotifi — menubar Emoji/GIF/Sticker picker for macOS (single-file, Python)
 
-This build:
+Features in this build:
   • Emoji/GIF/Sticker palette with fuzzy emoji search + synonyms.
-  • My Stickers — import images, auto-convert to ≤512px PNG, searchable & paste-ready.
+  • ⭐ My Stickers — import images, auto-convert to ≤512px PNG, searchable & paste-ready.
   • Inline '::' capture via CGEvent tap (preferred) or NSEvent fallback.
   • Backspace cleanup around inline insertion (no stray colons).
   • Global hotkey (⌘⇧E by default), thread-safe dispatch to main.
-  • TTS on selection (configurable).
-  • Preferences (persisted): launch at login, inline capture, hotkey recording, speech mode.
-  • UI polish with friendly banner, emoji section labels, clearer empty states.
+  • TTS on selection (configurable): Inline only, All capture, or None.
+  • Preferences (persisted): launch at login, inline capture toggle, hotkey record/clear, TTS mode.
+  • Welcome / Onboarding screen: guides user to grant Accessibility & Input Monitoring.
+  • UI polish: banner tips, clean layout, clear empty states.
   • First open after startup always defaults to the Emoji tab.
+  • GIPHY key is auto-resolved from env/Info.plist/optional secrets.json when packaged.
 """
 
 import os, sys, json, threading, time, difflib, re, subprocess, uuid
@@ -66,6 +68,7 @@ from AppKit import (
     NSBezelStyleRounded,
     NSOpenPanel,
     NSBitmapImageFileTypePNG,   # correct PNG enum in PyObjC
+    NSAlert,
 )
 from Foundation import NSObject, NSURL, NSData, NSIndexSet, NSOperationQueue, NSTimer
 from objc import super as objc_super
@@ -94,24 +97,82 @@ from Quartz import (
     CGEventPost,
 )
 
-# --- Accessibility trust (optional; hotkey works regardless) ---
-AX_PROMPT_FN = None
+# --- Accessibility trust (and deep links to settings) ---
+AX_PROMPT_AVAILABLE = False
 try:
     from ApplicationServices import AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt  # type: ignore
-    AX_PROMPT_FN = lambda: AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True})
+    AX_PROMPT_AVAILABLE = True
 except Exception:
     try:
         from Quartz import AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt  # type: ignore
-        AX_PROMPT_FN = lambda: AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True})
+        AX_PROMPT_AVAILABLE = True
     except Exception:
-        AX_PROMPT_FN = None
+        AX_PROMPT_AVAILABLE = False
 
-GIPHY_API_KEY = os.environ.get("GIPHY_API_KEY", "").strip()
+def is_accessibility_trusted(prompt: bool = False) -> bool:
+    if not AX_PROMPT_AVAILABLE:
+        return False
+    try:
+        opts = {kAXTrustedCheckOptionPrompt: bool(prompt)}
+        return bool(AXIsProcessTrustedWithOptions(opts))
+    except Exception:
+        return False
+
+def open_accessibility_settings():
+    try:
+        NSWorkspace.sharedWorkspace().openURL_(
+            NSURL.URLWithString_("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        )
+    except Exception:
+        pass
+
+def open_inputmonitor_settings():
+    try:
+        NSWorkspace.sharedWorkspace().openURL_(
+            NSURL.URLWithString_("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+        )
+    except Exception:
+        pass
+
+
+# --- Build-time / runtime API key resolution ---
+def _get_giphy_api_key() -> str:
+    # 1) Shell env (dev, or if user set launchctl env)
+    k = (os.environ.get("GIPHY_API_KEY") or "").strip()
+    if k:
+        return k
+    # 2) Packaged app’s Info.plist (py2app injected)
+    try:
+        from Foundation import NSBundle
+        info = (NSBundle.mainBundle().infoDictionary() or {})
+        k = (info.get("GIPHYApiKey") or
+             (info.get("LSEnvironment") or {}).get("GIPHY_API_KEY") or "")
+        if k:
+            return str(k).strip()
+    except Exception:
+        pass
+    # 3) Optional secrets.json bundled as a resource
+    try:
+        from Foundation import NSBundle
+        bundle = NSBundle.mainBundle()
+        rpath = bundle.resourcePath()
+        spath = os.path.join(rpath, "secrets.json")
+        if os.path.exists(spath):
+            import json as _json
+            with open(spath, "r", encoding="utf-8") as f:
+                kk = (_json.load(f).get("GIPHY_API_KEY") or "").strip()
+                if kk:
+                    return kk
+    except Exception:
+        pass
+    return ""
+
+GIPHY_API_KEY = _get_giphy_api_key()
 TRIGGER_TOKEN = "::"  # inline trigger
 
 # ---- Shared HTTP session + caches ----
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "Emotifi/2.8"})
+HTTP.headers.update({"User-Agent": "Emotifi/3.2"})
 IMG_CACHE: Dict[str, bytes] = {}     # url -> bytes
 
 # ========= Preferences (persisted) =========
@@ -128,6 +189,7 @@ DEFAULT_PREFS = {
     "enable_hotkey": True,
     "hotkey": "CMD+SHIFT+E",
     "tts_mode": "inline",     # "inline" | "all" | "none"
+    "onboard_done": False,    # show welcome screen on first run / until granted
 }
 
 def _ensure_dir(p):
@@ -173,6 +235,8 @@ class Prefs:
     def tts_mode(self):
         v = str(self.get("tts_mode") or "inline")
         return v if v in ("inline","all","none") else "inline"
+    @property
+    def onboard_done(self): return bool(self.get("onboard_done"))
 
 PREFS = Prefs()
 
@@ -206,17 +270,21 @@ def _parts_to_human(key: str, mods: int) -> str:
     return "+".join(pieces)
 
 def _enable_launch_at_login(enable: bool):
-    """Create/remove LaunchAgent to run this script on login (good for dev builds)."""
+    """Create/remove LaunchAgent to run this script/app on login."""
     try:
         _ensure_dir(LAUNCH_AGENTS_DIR)
         if enable:
-            python = sys.executable
-            script = os.path.abspath(__file__)
+            is_frozen = getattr(sys, 'frozen', False)
+            if is_frozen:
+                program_args = [sys.executable]  # .../Emotifi.app/Contents/MacOS/Emotifi
+            else:
+                program_args = [sys.executable, os.path.abspath(__file__)]
+            args_xml = "".join(f"<string>{a}</string>" for a in program_args)
             plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
     <key>Label</key><string>{APP_ID}</string>
-    <key>ProgramArguments</key><array><string>{python}</string><string>{script}</string></array>
+    <key>ProgramArguments</key><array>{args_xml}</array>
     <key>RunAtLoad</key><true/>
     <key>StandardOutPath</key><string>{APP_SUPPORT_DIR}/emotifi.log</string>
     <key>StandardErrorPath</key><string>{APP_SUPPORT_DIR}/emotifi.err</string>
@@ -349,7 +417,7 @@ class EmojiSearch:
 class GiphySearch:
     def __init__(self, kind: str):
         self.kind = kind  # 'gif' or 'sticker'
-        self.api_key = os.environ.get("GIPHY_API_KEY", "").strip()
+        self.api_key = GIPHY_API_KEY
         self.last_status = None
         self.last_error = None
 
@@ -358,7 +426,7 @@ class GiphySearch:
         self.last_error = None
         if not self.api_key:
             self.last_error = "Missing GIPHY_API_KEY"
-            print("[Giphy] No API key set. Export GIPHY_API_KEY first.")
+            print("[Giphy] No API key set. Provide one via env/Info.plist/secrets.json.")
             return []
         endpoint = "https://api.giphy.com/v1/gifs/search"
         if self.kind == "sticker":
@@ -498,7 +566,6 @@ def backspace(n=1):
 
 # --- robust PNG resizing/saving ---
 def _best_bitmap_rep(nsimg: NSImage):
-    """Return an NSBitmapImageRep for the image (or None)."""
     try:
         tiff = nsimg.TIFFRepresentation()
         if not tiff:
@@ -510,7 +577,6 @@ def _best_bitmap_rep(nsimg: NSImage):
         return None
 
 def _resize_png_bytes(nsimg: NSImage, max_dim: int = 512) -> Optional[bytes]:
-    """Returns PNG bytes of nsimg scaled to fit within max_dim while preserving aspect."""
     try:
         rep = _best_bitmap_rep(nsimg)
         if not rep:
@@ -547,10 +613,7 @@ def _resize_png_bytes(nsimg: NSImage, max_dim: int = 512) -> Optional[bytes]:
         return None
 
 def import_image_as_sticker() -> Optional[str]:
-    """
-    Opens a file dialog, imports an image, converts to PNG ≤512px, stores it in STICKERS_DIR.
-    Returns absolute file path or None.
-    """
+    """Open file dialog, import image, convert to PNG ≤512px, save to STICKERS_DIR."""
     try:
         panel = NSOpenPanel.openPanel()
         panel.setCanChooseFiles_(True)
@@ -601,6 +664,137 @@ def import_image_as_sticker() -> Optional[str]:
     except Exception as e:
         print(f"[Stickers] Import failed: {e}")
         return None
+
+# ---------- Welcome / Onboarding Panel ----------
+class WelcomePanel(NSObject):
+    """
+    First-run screen:
+      • Welcomes the user with a slogan
+      • Shows permission status (Accessibility, Input Monitoring)
+      • Buttons to request/open the right System Settings panes
+      • Continue button to proceed (keeps showing until Accessibility granted)
+    """
+    def initWithOwner_(self, owner):
+        self = objc_super(WelcomePanel, self).init()
+        if self is None: return None
+        self.owner = owner
+        self._build_panel()
+        return self
+
+    def _build_panel(self):
+        w, h = 620, 420
+        frame = NSScreen.mainScreen().frame()
+        x = frame.size.width / 2 - w / 2
+        y = frame.size.height / 2 - h / 2
+        self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(x, y, w, h),
+            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable,
+            2, True,
+        )
+        self.panel.setTitle_("Welcome to Emotifi")
+        self.panel.setLevel_(NSFloatingWindowLevel)
+        self.panel.setCollectionBehavior_(NSWindowCollectionBehaviorCanJoinAllSpaces)
+        content = self.panel.contentView()
+
+        def label(text, x, y, w_, h_, size=14, bold=False):
+            t = NSTextField.alloc().initWithFrame_(NSMakeRect(x, y, w_, h_))
+            t.setStringValue_(text)
+            t.setBezeled_(False); t.setDrawsBackground_(False)
+            t.setEditable_(False); t.setSelectable_(False)
+            try:
+                font = t.font()
+                if bold:
+                    from AppKit import NSFontManager, NSFont
+                    fm = NSFontManager.sharedFontManager()
+                    font = fm.convertFont_toHaveTrait_(font, 2)  # NSBoldFontMask
+                if size != 14:
+                    from AppKit import NSFont
+                    font = NSFont.systemFontOfSize_(size)
+                t.setFont_(font)
+            except Exception: pass
+            content.addSubview_(t)
+            return t
+
+        label("✨ Emotifi", 24, h-64, 400, 28, size=24, bold=True)
+        label("Emoji • GIF • Sticker picker for your Mac", 24, h-92, 400, 22, size=14, bold=False)
+        label("Set up permissions so the hotkey and inline capture work everywhere.", 24, h-118, 560, 20)
+
+        # Status lines
+        self.lbl_ax = label("Accessibility: Checking…", 40, h-170, 480, 20)
+        self.lbl_im = label("Input Monitoring: Enable in System Settings → Privacy & Security → Input Monitoring", 40, h-196, 560, 20)
+
+        # Buttons
+        self.btn_req_ax = NSButton.alloc().initWithFrame_(NSMakeRect(40, h-238, 200, 30))
+        self.btn_req_ax.setTitle_("Request Accessibility")
+        self.btn_req_ax.setBezelStyle_(NSBezelStyleRounded)
+        self.btn_req_ax.setTarget_(self); self.btn_req_ax.setAction_("requestAX:")
+        content.addSubview_(self.btn_req_ax)
+
+        self.btn_open_ax = NSButton.alloc().initWithFrame_(NSMakeRect(250, h-238, 220, 30))
+        self.btn_open_ax.setTitle_("Open Accessibility Settings")
+        self.btn_open_ax.setBezelStyle_(NSBezelStyleRounded)
+        self.btn_open_ax.setTarget_(self); self.btn_open_ax.setAction_("openAX:")
+        content.addSubview_(self.btn_open_ax)
+
+        self.btn_open_im = NSButton.alloc().initWithFrame_(NSMakeRect(40, h-276, 200, 30))
+        self.btn_open_im.setTitle_("Open Input Monitoring")
+        self.btn_open_im.setBezelStyle_(NSBezelStyleRounded)
+        self.btn_open_im.setTarget_(self); self.btn_open_im.setAction_("openIM:")
+        content.addSubview_(self.btn_open_im)
+
+        # Continue
+        self.btn_continue = NSButton.alloc().initWithFrame_(NSMakeRect(w-140, 18, 110, 32))
+        self.btn_continue.setTitle_("Continue")
+        self.btn_continue.setBezelStyle_(NSBezelStyleRounded)
+        self.btn_continue.setTarget_(self); self.btn_continue.setAction_("continue:")
+        content.addSubview_(self.btn_continue)
+
+        # Divider
+        box = NSBox.alloc().initWithFrame_(NSMakeRect(20, 56, w-40, 1))
+        box.setBoxType_(2); content.addSubview_(box)
+
+        self._refresh_status_labels()
+
+    def _refresh_status_labels(self):
+        ax_ok = is_accessibility_trusted(False)
+        self.lbl_ax.setStringValue_("Accessibility: " + ("✅ Granted" if ax_ok else "❌ Not granted"))
+
+    def requestAX_(self, _):
+        _ = is_accessibility_trusted(True)  # prompts if possible
+        open_accessibility_settings()
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(1.0, self, "refreshLater:", None, False)
+
+    def refreshLater_(self, _):
+        self._refresh_status_labels()
+
+    def openAX_(self, _):
+        open_accessibility_settings()
+
+    def openIM_(self, _):
+        open_inputmonitor_settings()
+
+    def continue_(self, _):
+        if is_accessibility_trusted(False):
+            PREFS.set("onboard_done", True)
+            self.panel.orderOut_(None)
+            try:
+                self.owner.start_inputs_after_onboarding()
+            except Exception:
+                pass
+        else:
+            try:
+                alert = NSAlert.alloc().init()
+                alert.setMessageText_("Accessibility not granted")
+                alert.setInformativeText_("Please grant Accessibility to Emotifi in System Settings to continue. This enables the hotkey and inline capture.")
+                alert.runModal()
+            except Exception:
+                pass
+            self._refresh_status_labels()
+
+    def show(self):
+        NSApp.activateIgnoringOtherApps_(True)
+        self.panel.makeKeyAndOrderFront_(None)
+        self._refresh_status_labels()
 
 # ---------- Palette window ----------
 class PaletteWindow(NSObject):
@@ -840,7 +1034,7 @@ class PaletteWindow(NSObject):
         self._debounce_timer.start()
 
     def _giphy_hint(self, engine: "GiphySearch", q: str) -> str:
-        if engine.last_status in (401, 403): return "Giphy: Unauthorized/Forbidden. Check GIPHY_API_KEY."
+        if engine.last_status in (401, 403): return "Giphy: Unauthorized/Forbidden. Check GIPHY key."
         if engine.last_status in (429,): return "Giphy: Rate limited. Try later."
         if engine.last_status and 500 <= engine.last_status < 600: return "Giphy: server issue. Try again."
         if engine.last_error: return f"Network/API error: {engine.last_error}"
@@ -887,7 +1081,7 @@ class PaletteWindow(NSObject):
     def _update_preview(self, row: int):
         try:
             it = self.current_items[row]
-            self.info.setStringValue_(f"{it.kind.UPPER() if hasattr(it.kind,'UPPER') else it.kind.upper()}\n{it.display}\n\nEnter: insert   ⌥Enter: link   Esc: close")
+            self.info.setStringValue_(f"{it.kind.upper()}\n{it.display}\n\nEnter: insert   ⌥Enter: link   Esc: close")
             if it.kind == "emoji":
                 self.preview.setImage_(None); return
             url = it.thumb_url or it.media_url or it.insert_text
@@ -975,7 +1169,7 @@ class GlobalInput:
         self.buffer = deque(maxlen=64)
         self.tap = None
         self._runloop_src = None
-        self._nsevent_monitor = None
+               self._nsevent_monitor = None
         self._hotkey_monitor_global = None
         self._hotkey_monitor_local = None
         self._wanted_key, self._wanted_mods = _human_hotkey_to_parts(PREFS.hotkey)
@@ -987,6 +1181,7 @@ class GlobalInput:
         self._hotkey_enabled = PREFS.enable_hotkey
         self._inline_enabled = PREFS.enable_inline
 
+    # ---- hotkey helpers ----
     def _mods_match(self, flags: int) -> bool:
         mask = (NSEventModifierFlagCommand | NSEventModifierFlagShift |
                 NSEventModifierFlagControl | NSEventModifierFlagOption)
@@ -1043,6 +1238,7 @@ class GlobalInput:
         if enabled:
             self.start_hotkey()
 
+    # ---- inline helpers ----
     def _on_main(self, fn):
         NSOperationQueue.mainQueue().addOperationWithBlock_(fn)
 
@@ -1116,6 +1312,7 @@ class GlobalInput:
             return None
         return ch
 
+    # CGEvent tap path (best)
     def _start_cgeventtap(self):
         if not self._inline_enabled:
             return False
@@ -1129,7 +1326,7 @@ class GlobalInput:
                     for ch in chars:
                         res = self._push_and_check(ch, erase=True, via_tap=True)
                         if res is None:
-                            return None
+                            return None  # swallow
             except Exception:
                 pass
             return event
@@ -1137,8 +1334,8 @@ class GlobalInput:
         tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, 0, CGEventMaskBit(kCGEventKeyDown), callback, None)
         if not tap:
             tap = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap, 0, CGEventMaskBit(kCGEventKeyDown), callback, None)
-        if not tap:
-            return False
+            if not tap:
+                return False
         src = CFMachPortCreateRunLoopSource(None, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetCurrent(), src, Quartz.kCFRunLoopCommonModes)
         CGEventTapEnable(tap, True)
@@ -1147,6 +1344,7 @@ class GlobalInput:
         CFRunLoopRun()
         return True
 
+    # NSEvent fallback (cannot swallow)
     def _start_nsevent_monitor(self):
         if not self._inline_enabled:
             return
@@ -1165,21 +1363,28 @@ class GlobalInput:
         print("[INLINE] NSEvent monitor active (no swallow). Type :: then query; we’ll clean on insert/cancel).")
 
     def inline_cleanup_on_insert(self):
+        """
+        Called by the palette right before inserting.
+        Ensures any leaked '::query' (fallback) or stray ':' (tap race) is removed.
+        """
         if self.capturing:
             if not self.using_tap:
-                backspace(2 + self.capture_len)
+                backspace(2 + self.capture_len)   # NSEvent fallback: remove '::' + query
             else:
-                backspace(1)
+                backspace(1)                       # Tap path: defensively remove one stray ':'
             self.capturing = False
             self.capture_len = 0
             self.fallback_cleanup = False
 
     def start(self):
+        # try to nudge AX status check (non-blocking)
         try:
-            if AX_PROMPT_FN: AX_PROMPT_FN()
+            if AX_PROMPT_AVAILABLE:
+                AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: False})
         except Exception:
             pass
 
+        # start hotkey monitors
         self.start_hotkey()
 
         def run_tap():
@@ -1189,7 +1394,7 @@ class GlobalInput:
             except Exception:
                 ok = False
             if not ok and self._inline_enabled:
-                print("[WARN] CGEventTap unavailable. Enable Accessibility & Input Monitoring for your Python & Terminal/VSCode.")
+                print("[WARN] CGEventTap unavailable. Enable Accessibility & Input Monitoring for your app.")
                 try:
                     self._start_nsevent_monitor()
                 except Exception:
@@ -1388,6 +1593,8 @@ class MenuApp(rumps.App):
             pass
 
         self.prefs_ui = PreferencesPanel.alloc().initWithOwner_(self)
+        self.welcome = WelcomePanel.alloc().initWithOwner_(self)
+
         self.menu = [
             rumps.MenuItem("Open Palette (⌘⇧E or '::')", callback=self.open_palette_hotkey),
             rumps.MenuItem("Add Sticker…", callback=self.add_sticker),
@@ -1399,14 +1606,29 @@ class MenuApp(rumps.App):
 
         self._first_open_done = False
 
+        # Defer starting input capture until after onboarding if needed
         self.input = GlobalInput(self.open_palette_hotkey, self.palette)
-        self.input.start()
+        if PREFS.onboard_done and is_accessibility_trusted(False):
+            self.input.start()
+        else:
+            self.show_welcome_then_inputs()
 
         if PREFS.launch_at_login and not os.path.exists(LAUNCH_PLIST):
             _enable_launch_at_login(True)
 
         global ACTIVE_INPUT
         ACTIVE_INPUT = self.input
+
+    # Called by WelcomePanel when user presses Continue successfully
+    def start_inputs_after_onboarding(self):
+        PREFS.set("onboard_done", True)
+        try:
+            self.input.start()
+        except Exception:
+            pass
+
+    def show_welcome_then_inputs(self):
+        self.welcome.show()
 
     def open_prefs(self, *_):
         self.prefs_ui.show()
