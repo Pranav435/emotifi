@@ -50,8 +50,8 @@ OPTIONS = {
         "CFBundleName": "Emotifi",
         "CFBundleDisplayName": "Emotifi",
         "CFBundleIdentifier": "com.emotifi.app",
-        "CFBundleShortVersionString": "0.9.0",
-        "CFBundleVersion": "0.9.0",
+        "CFBundleShortVersionString": "1.0.0",
+        "CFBundleVersion": "100",
         "LSUIElement": True,
         "NSAppleEventsUsageDescription": "Emotifi pastes content into other apps when you choose an item.",
         # put key at build time
