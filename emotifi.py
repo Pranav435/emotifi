@@ -1169,7 +1169,7 @@ class GlobalInput:
         self.buffer = deque(maxlen=64)
         self.tap = None
         self._runloop_src = None
-               self._nsevent_monitor = None
+        self._nsevent_monitor = None
         self._hotkey_monitor_global = None
         self._hotkey_monitor_local = None
         self._wanted_key, self._wanted_mods = _human_hotkey_to_parts(PREFS.hotkey)
@@ -1688,7 +1688,26 @@ class MenuApp(rumps.App):
         rumps.quit_application()
 
 # ---------- Bootstrap ----------
+def _run_app():
+    # Use the *global* os imported at top of file
+    log_path = os.path.expanduser('~/Library/Application Support/Emotifi/launch_crash.log')
+    try:
+        app = MenuApp()
+
+        # In a bundled app (py2app), LSUIElement in Info.plist already sets policy;
+        # avoid resetting it there. Only set policy in dev runs.
+        if not getattr(sys, 'frozen', False):
+            from AppKit import NSApplicationActivationPolicyAccessory, NSApp
+            NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+
+        app.run()
+    except Exception:
+        import traceback  # ok to import here; DO NOT import os here
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "w") as f:
+            traceback.print_exc(file=f)
+        print(f"[Emotifi] Crash at launch. See log: {log_path}")
+        raise
+
 if __name__ == "__main__":
-    app = MenuApp()
-    NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
-    app.run()
+    _run_app()
