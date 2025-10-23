@@ -3,7 +3,13 @@
 """
 Emotifi — menubar Emoji/GIF/Sticker picker for macOS (single-file, Python)
 
-Features in this build:
+This build adds proper animated GIF/MP4 pasting support:
+  • Tries to paste raw GIF/MP4 bytes to NSPasteboard with correct UTIs (keeps animation).
+  • Falls back to raster image paste (PNG/TIFF) if the target app doesn’t accept movie/GIF UTIs.
+  • Finally falls back to inserting a link if binary pastes are not accepted.
+  • Improves GIPHY URL selection (prefers .gif/.mp4 when available).
+
+Other features preserved from the original:
   • Emoji/GIF/Sticker palette with fuzzy emoji search + synonyms.
   • ⭐ My Stickers — import images, auto-convert to ≤512px PNG, searchable & paste-ready.
   • Inline '::' capture via CGEvent tap (preferred) or NSEvent fallback.
@@ -11,10 +17,10 @@ Features in this build:
   • Global hotkey (⌘⇧E by default), thread-safe dispatch to main.
   • TTS on selection (configurable): Inline only, All capture, or None.
   • Preferences (persisted): launch at login, inline capture toggle, hotkey record/clear, TTS mode.
-  • Welcome / Onboarding screen: guides user to grant Accessibility & Input Monitoring.
+  • Welcome / Onboarding screen for Accessibility/Input Monitoring.
   • UI polish: banner tips, clean layout, clear empty states.
   • First open after startup always defaults to the Emoji tab.
-  • GIPHY key is auto-resolved from env/Info.plist/optional secrets.json when packaged.
+  • GIPHY key auto-resolves from env/Info.plist/optional secrets.json when packaged.
 """
 
 import os, sys, json, threading, time, difflib, re, subprocess, uuid
@@ -172,7 +178,7 @@ TRIGGER_TOKEN = "::"  # inline trigger
 
 # ---- Shared HTTP session + caches ----
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "Emotifi/3.2"})
+HTTP.headers.update({"User-Agent": "Emotifi/3.3"})
 IMG_CACHE: Dict[str, bytes] = {}     # url -> bytes
 
 # ========= Preferences (persisted) =========
@@ -190,6 +196,8 @@ DEFAULT_PREFS = {
     "hotkey": "CMD+SHIFT+E",
     "tts_mode": "inline",     # "inline" | "all" | "none"
     "onboard_done": False,    # show welcome screen on first run / until granted
+    # New toggle: prefer animated paste (GIF/MP4) when possible
+    "prefer_animated": True,
 }
 
 def _ensure_dir(p):
@@ -237,6 +245,8 @@ class Prefs:
         return v if v in ("inline","all","none") else "inline"
     @property
     def onboard_done(self): return bool(self.get("onboard_done"))
+    @property
+    def prefer_animated(self): return bool(self.get("prefer_animated"))
 
 PREFS = Prefs()
 
@@ -320,6 +330,7 @@ class ResultItem:
     insert_text: str
     thumb_url: Optional[str] = None
     media_url: Optional[str] = None  # may be http(s) URL, file:// URL, or absolute path
+    alt_media_url: Optional[str] = None  # e.g., MP4 alternative to GIF
 
 # ---------- Emoji search (improved fuzzy matching + synonyms) ----------
 class EmojiSearch:
@@ -445,11 +456,15 @@ class GiphySearch:
         for item in data.get("data", [])[:limit]:
             title = item.get("title") or self.kind.upper()
             images = item.get("images", {}) or {}
+            # Prefer true GIF and MP4 originals when available
+            gif_url = (images.get("original", {}) or {}).get("url")
+            mp4_url = (images.get("original_mp4", {}) or {}).get("mp4")
+            # Nice small preview for thumbnails / quick loads
             preview = images.get("fixed_height_small") or images.get("preview_gif") or images.get("downsized_small") or {}
             thumb_url = preview.get("url")
-            media_url = (images.get("original", {}) or {}).get("url") or thumb_url
+            media_url = gif_url or mp4_url or thumb_url
             share = item.get("url") or media_url or thumb_url or ""
-            out.append(ResultItem(self.kind, title, self.kind.upper(), share, thumb_url, media_url))
+            out.append(ResultItem(self.kind, title, self.kind.upper(), share, thumb_url, media_url, alt_media_url=mp4_url if gif_url else gif_url))
         if not out:
             print(f"[Giphy {self.kind}] empty results for q='{q}'. status={self.last_status}")
         return out
@@ -483,6 +498,7 @@ class MyStickerSearch:
         return out
 
 # ---------- Image & paste helpers ----------
+
 def _nsimage_from_any(uri_or_path: str) -> Optional[NSImage]:
     try:
         if uri_or_path.startswith("file://"):
@@ -556,6 +572,67 @@ def paste_image_from_url_or_fallback(url_or_path: Optional[str], prev_app=None) 
     except Exception:
         insert_text_via_keystroke_paste(url_or_path, prev_app=prev_app)
         return True
+
+# --- Animated paste helpers (GIF/MP4) ---
+GIF_UTI = "com.compuserve.gif"      # legacy UTI works widely
+MP4_UTI = "public.mpeg-4"           # MPEG-4 movie UTI
+
+def _pb_cmd_v(prev_app=None):
+    _activate_app_and_sleep(prev_app)
+    src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState)
+    cmd_down = CGEventCreateKeyboardEvent(src, 0x37, True)  # Cmd
+    v_down = CGEventCreateKeyboardEvent(src, 0x09, True)    # v
+    v_up   = CGEventCreateKeyboardEvent(src, 0x09, False)
+    cmd_up = CGEventCreateKeyboardEvent(src, 0x37, False)
+    Quartz.CGEventSetFlags(v_down, kCGEventFlagMaskCommand)
+    Quartz.CGEventSetFlags(v_up,   kCGEventFlagMaskCommand)
+    CGEventPost(0, cmd_down); CGEventPost(0, v_down); CGEventPost(0, v_up); CGEventPost(0, cmd_up)
+
+def paste_raw_bytes(data: bytes, type_identifiers: List[str], prev_app=None) -> bool:
+    try:
+        pb = NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        nsdata = NSData.dataWithBytes_length_(data, len(data))
+        wrote_any = False
+        # Offer multiple types; some apps sniff one or another.
+        for t in type_identifiers:
+            try:
+                wrote_any = pb.setData_forType_(nsdata, t) or wrote_any
+            except Exception:
+                pass
+        _pb_cmd_v(prev_app)
+        return bool(wrote_any)
+    except Exception:
+        return False
+
+def _download_bytes(url: str) -> Optional[bytes]:
+    try:
+        data = IMG_CACHE.get(url)
+        if data is None:
+            r = HTTP.get(url, timeout=12)
+            r.raise_for_status()
+            data = r.content
+            IMG_CACHE[url] = data
+        return data
+    except Exception:
+        return None
+
+def paste_animated_from_url(url: str, prev_app=None) -> bool:
+    if not url:
+        return False
+    lower = url.lower()
+    data = _download_bytes(url)
+    if not data:
+        return False
+    # Heuristic by extension/signature
+    if lower.endswith(".gif") or data[:6] in (b"GIF89a", b"GIF87a"):
+        return paste_raw_bytes(data, [GIF_UTI, "public.data"], prev_app=prev_app)
+    if lower.endswith(".mp4"):
+        return paste_raw_bytes(data, [MP4_UTI, "public.movie", "public.data"], prev_app=prev_app)
+    # Some GIPHY "url" is CDN without extension; try GIF signature first.
+    if data[:6] in (b"GIF89a", b"GIF87a"):
+        return paste_raw_bytes(data, [GIF_UTI, "public.data"], prev_app=prev_app)
+    return False
 
 def backspace(n=1):
     src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState)
@@ -1117,12 +1194,24 @@ class PaletteWindow(NSObject):
                 if it.kind == "emoji":
                     insert_text_via_keystroke_paste(it.insert_text, prev_app=prev)
                 elif it.kind in ("gif", "sticker", "mystick"):
+                    media = it.media_url or it.thumb_url or it.insert_text
+                    # ⌥Enter → insert link text only (for GIF/Stickers)
                     if link_mode and it.kind != "mystick":
-                        insert_text_via_keystroke_paste(it.media_url or it.insert_text, prev_app=prev)
+                        insert_text_via_keystroke_paste(media, prev_app=prev)
                     else:
-                        ok = paste_image_from_url_or_fallback(it.media_url or it.thumb_url or it.insert_text, prev_app=prev)
-                        if not ok:
-                            insert_text_via_keystroke_paste(it.media_url or it.insert_text, prev_app=prev)
+                        # Paste order is configurable via prefer_animated
+                        attempted = False
+                        if it.kind != "mystick" and PREFS.prefer_animated:
+                            attempted = paste_animated_from_url(media, prev_app=prev)
+                            # Try alternative media (mp4 <-> gif) if available and first attempt failed
+                            if (not attempted) and it.alt_media_url:
+                                attempted = paste_animated_from_url(it.alt_media_url, prev_app=prev)
+                        if not attempted:
+                            # Rasterize (static) paste
+                            raster_ok = paste_image_from_url_or_fallback(media, prev_app=prev)
+                            if not raster_ok:
+                                # Final fallback: just paste link/text
+                                insert_text_via_keystroke_paste(media, prev_app=prev)
                 try:
                     if ACTIVE_INPUT:
                         ACTIVE_INPUT.last_triggered_inline = False
@@ -1423,7 +1512,7 @@ class PreferencesPanel(NSObject):
         return self
 
     def _build_panel(self):
-        w, h = 580, 380
+        w, h = 580, 420
         frame = NSScreen.mainScreen().frame()
         x = frame.size.width / 2 - w / 2
         y = frame.size.height / 2 - h / 2
@@ -1470,7 +1559,8 @@ class PreferencesPanel(NSObject):
 
         self.chk_login  = checkbox("Launch at login",               y_cursor, "launch_at_login"); y_cursor -= 30
         self.chk_inline = checkbox("Enable inline capture (“::”)",  y_cursor, "enable_inline");   y_cursor -= 30
-        self.chk_hotkey = checkbox("Enable global shortcut",        y_cursor, "enable_hotkey");   y_cursor -= 40
+        self.chk_hotkey = checkbox("Enable global shortcut",        y_cursor, "enable_hotkey");   y_cursor -= 30
+        self.chk_anim   = checkbox("Prefer animated paste (GIF/MP4) when possible", y_cursor, "prefer_animated"); y_cursor -= 40
 
         st_label = NSTextField.alloc().initWithFrame_(NSMakeRect(40, y_cursor, 90, 24))
         st_label.setStringValue_("Shortcut:")

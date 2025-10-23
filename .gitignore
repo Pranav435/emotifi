@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.pkl
+*.dmg
 *.egg-info/
 *.egg
 .Python
