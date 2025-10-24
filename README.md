@@ -14,7 +14,8 @@ Hi, I’m Pranav. I’m a college student, which means:
 
 But what about **GIFs**? **Stickers**? Actual fun? Apple never added them, and the apps that exist charge too much.
 
-So I hacked together **Emotifi** — a tiny menubar app that gives you a **searchable palette** of emojis, GIFs, stickers, and even your own personal sticker pack. It’s scrappy, it’s open-source, and it makes my Mac (and hopefully yours) less boring.
+So I hacked together **Emotifi** — a tiny menubar app that gives you a **searchable palette** of emojis, GIFs, stickers, and even your own personal sticker pack.
+It’s scrappy, it’s open-source, and it makes my Mac (and hopefully yours) less boring.
 
 ---
 
@@ -79,6 +80,26 @@ python emotifi.py
 
 ---
 
+## After Every Update ⚙️
+
+Because Emotifi is **unsigned**, macOS treats each version like a new app.
+That means it might forget that you already gave it permission to control your keyboard (Accessibility) or monitor input.
+
+If your hotkey (`CMD+SHIFT+E`) or inline typing (`::`) stops working **after an update**, just:
+
+1. Go to **System Settings → Privacy & Security → Accessibility**
+
+   * Remove `Emotifi` if it’s listed
+   * Add it again (`+` → Applications → Emotifi.app)
+   * Toggle it ON ✅
+2. Do the same in **Privacy & Security → Input Monitoring**
+3. Quit and relaunch Emotifi
+4. Boom — everything works again ✨
+
+I know it’s annoying — blame Apple’s $100 paywall, not me. Once I can afford the Developer ID, you’ll never have to do this again.
+
+---
+
 ## Using Emotifi ⌨️
 
 | Action             | Keys            | Notes                                  |
@@ -127,18 +148,21 @@ Add your own memes, logos, reaction shots:
 
 ---
 
-## Donate 💸 (make Gatekeeper stop yelling)
+## Donate 💸 (make Gatekeeper chill out)
 
-Right now, Emotifi is unsigned. macOS yells the first time you open it. To fix that, I need an **Apple Developer ID**: **$100/year**.
+Right now, Emotifi is unsigned — which means macOS thinks I’m suspicious every time I hit “Build.”
+To fix that, I need an **Apple Developer ID**: **$100/year**.
 
-If you like Emotifi and want to help me ship a smoother version, you can donate here:
+If you enjoy Emotifi or just want to stop seeing those “Open Anyway” pop-ups, you can help fund that right here:
 
 👉 [**Donate via PayPal**](https://paypal.me/theblindiephoenix)
 
 * 🎯 Goal: $100
-* ✅ Current: (I’ll update this as donations come in)
+* ✅ Current: I’ll update this as donations come in
 
-Even a small donation helps me as a college student keep this free and fun for everyone.
+Even a small donation helps a college student like me ship smoother builds — and maybe even get macOS to finally trust me. 😅
+
+*(You can also [jump to the donations section](#donate--make-gatekeeper-chill-out) anytime from the top.)*
 
 ---
 
@@ -153,4 +177,4 @@ This project is licensed under the [MIT License](./LICENSE).
 Built by **Pranav** (between classes and caffeine).
 
 * YouTube → [Blindie Phoenix](https://youtube.com/@imtheblindiephoenix)
-* GitHub → [yourusername](https://github.com/Pranav435)
+* GitHub → [Pranav435](https://github.com/Pranav435)
